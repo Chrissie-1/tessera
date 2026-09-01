@@ -91,11 +91,16 @@ jobs:
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
           # Everything between this version's heading and the next one.
-          awk -v v="$VERSION" '
-            $0 ~ "^## \\[" v "\\]" { on = 1; next }
-            on && /^## \[/         { exit }
-            on                     { print }
-          ' CHANGELOG.md > notes.md
+          # The heading is matched with index() on a literal rather than a
+          # built-up regex: the version contains dots, and escaping the
+          # brackets through YAML, sh and awk quoting silently produced a
+          # pattern that matched nothing.
+          awk -v v="## [$VERSION]" '
+            index($0, v) == 1 { on = 1; next }
+            on && /^## \[/    { exit }
+            on                { print }
+          ' CHANGELOG.md \
+            | grep -v '^\[.*\]: http' > notes.md
           if [ ! -s notes.md ]; then
             echo "No CHANGELOG.md section for $VERSION." > notes.md
           fi
