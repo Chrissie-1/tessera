@@ -20,6 +20,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The Phase 4 attention kernel. Triton only runs on CUDA, so it is kept out
+# of the default install: the CPU path in attention.py is what CI exercises.
+gpu = [
+    "triton>=3.0",
+]
 dev = [
     "grpcio-tools>=1.60",
     "pytest>=8.0",
