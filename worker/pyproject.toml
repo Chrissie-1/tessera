@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tessera-worker"
+version = "0.1.0"
+description = "Tessera inference worker: paged KV cache, continuous batching, speculative decoding"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.44",
+    "grpcio>=1.60",
+    "protobuf>=4.25",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.6",
+    "numpy>=1.26",
+    "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools>=1.60",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.5",
+    "black>=24.0",
+]
+
+[project.scripts]
+tessera-worker = "tessera_worker.server:serve"
+
+[tool.setuptools.packages.find]
+include = ["tessera_worker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "slow: tests that load a real (non-tiny) model or run long decodes",
+    "gpu: tests that require CUDA",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+# Generated protobuf stubs are not ours to lint.
+extend-exclude = ["tessera_worker/generated"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+extend-exclude = "tessera_worker/generated"

@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Generated gRPC stubs (regenerate with scripts/gen_proto.sh)
+worker/tessera_worker/generated/*.py
+worker/tessera_worker/generated/*.pyi
+!worker/tessera_worker/generated/__init__.py
+
+# Model weights and benchmark output
+artifacts/
+*.pt
+*.safetensors
+bench/results/*.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

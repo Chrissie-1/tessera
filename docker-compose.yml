@@ -1,0 +1,45 @@
+# Local development stack: one gateway, one worker.
+# Bring up with `docker compose up --build`, then:
+#   curl -X POST localhost:8080/v1/completions \
+#     -H 'Content-Type: application/json' \
+#     -d '{"prompt": "Hello", "max_tokens": 5}'
+
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      TESSERA_MODEL: ${TESSERA_MODEL:-gpt2}
+      TESSERA_DEVICE: cpu
+      TESSERA_GRPC_PORT: "50051"
+      TESSERA_LOG_LEVEL: INFO
+    ports:
+      - "50051:50051"
+    volumes:
+      # Persist HF downloads so a rebuild does not re-fetch the weights.
+      - hf-cache:/home/tessera/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket;s=socket.create_connection(('localhost',50051),2);s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    environment:
+      TESSERA_GATEWAY_PORT: "8080"
+      TESSERA_WORKER_ENDPOINTS: http://worker:50051
+      TESSERA_MAX_IN_FLIGHT: "8"
+      TESSERA_LOG: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      worker:
+        condition: service_healthy
+
+volumes:
+  hf-cache:
