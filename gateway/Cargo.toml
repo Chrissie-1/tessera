@@ -15,6 +15,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+tokio-stream.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

@@ -4,12 +4,17 @@ package inference;
 
 // Tessera worker inference service.
 //
-// Phase 1 implements unary Generate + Health. The `stream` request field is
-// accepted but rejected with INVALID_ARGUMENT until continuous batching
-// (Phase 2) provides token-at-a-time emission.
+// Generate is unary. GenerateStream emits one message per token as it is
+// decoded, which continuous batching (Phase 2) makes possible: the scheduler
+// advances every running sequence one token per iteration, so a token is
+// available to forward long before the completion is finished.
 service Inference {
   // Generate a completion for a single prompt.
   rpc Generate (GenerateRequest) returns (GenerateResponse);
+
+  // Stream a completion token by token. Each message carries the newly
+  // decoded text only; the final message sets finished and finish_reason.
+  rpc GenerateStream (GenerateRequest) returns (stream GenerateResponse);
 
   // Liveness / capacity probe. The gateway uses in_flight for
   // least-in-flight routing and load shedding.
@@ -19,6 +24,9 @@ service Inference {
 message GenerateRequest {
   string prompt = 1;
   int32 max_tokens = 2;
+
+  // Ignored by Generate; GenerateStream always streams. Retained so a client
+  // built against the Phase 1 schema still parses.
   bool stream = 3;
 
   // Sampling controls. temperature <= 0 means greedy (argmax), which is the
@@ -33,7 +41,8 @@ message GenerateRequest {
 }
 
 message GenerateResponse {
-  // Generated continuation only, NOT including the prompt.
+  // Generated continuation only, NOT including the prompt. On a stream this
+  // is the delta for one token, not the text so far.
   string text = 1;
   bool finished = 2;
 

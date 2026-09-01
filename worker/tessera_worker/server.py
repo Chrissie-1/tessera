@@ -19,18 +19,43 @@ from .sampling import SamplingParams
 logger = logging.getLogger(__name__)
 
 
+def _params_from(request) -> SamplingParams:
+    """proto3 leaves unset numerics at zero; top_p 0 means "unset", not "drop
+    every token", so it is read as no filtering."""
+    return SamplingParams(
+        temperature=request.temperature,
+        top_p=request.top_p if request.top_p > 0 else 1.0,
+        seed=request.seed or None,
+    )
+
+
 class InferenceServicer(inference_pb2_grpc.InferenceServicer):
     """Translates gRPC messages into engine calls.
 
-    Phase 1 serves requests on a thread pool with no batching: each call holds
-    a slot for its full decode. Phase 2 replaces this with a continuous-batching
-    scheduler behind the same interface.
+    Requests run on a thread pool, one decode per call. The continuous
+    batching scheduler in `batching.py` is what shares a single forward pass
+    across concurrent sequences; wiring it in behind this interface is a
+    deployment change, not a protocol one.
     """
 
     def __init__(self, handle: EngineHandle) -> None:
         self._handle = handle
         self._in_flight = 0
         self._lock = threading.Lock()
+
+    def _validate(self, request, context) -> None:
+        """Reject a malformed request. Shared by unary and streaming."""
+        if request.max_tokens <= 0:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "max_tokens must be positive"
+            )
+
+        cap = self._handle.config.max_tokens_cap
+        if request.max_tokens > cap:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                f"max_tokens {request.max_tokens} exceeds cap {cap}",
+            )
 
     def _enter(self) -> None:
         with self._lock:
@@ -48,29 +73,8 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
     def Generate(self, request, context):  # noqa: N802 - gRPC naming
         request_id = request.request_id or str(uuid.uuid4())
 
-        if request.stream:
-            context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT,
-                "streaming is not implemented until Phase 2 (continuous batching)",
-            )
-
-        if request.max_tokens <= 0:
-            context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT, "max_tokens must be positive"
-            )
-
-        cap = self._handle.config.max_tokens_cap
-        if request.max_tokens > cap:
-            context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT,
-                f"max_tokens {request.max_tokens} exceeds cap {cap}",
-            )
-
-        params = SamplingParams(
-            temperature=request.temperature,
-            top_p=request.top_p if request.top_p > 0 else 1.0,
-            seed=request.seed or None,
-        )
+        self._validate(request, context)
+        params = _params_from(request)
 
         self._enter()
         try:
@@ -101,6 +105,50 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
             completion_tokens=result.completion_tokens,
             finish_reason=result.finish_reason,
         )
+
+    def GenerateStream(self, request, context):  # noqa: N802 - gRPC naming
+        """Emit one message per token as it is decoded.
+
+        Each message carries only the new token's text, so a client renders by
+        appending rather than by diffing against what it already showed. Token
+        counts are reported on the final message, where they are known.
+        """
+        request_id = request.request_id or str(uuid.uuid4())
+        self._validate(request, context)
+
+        engine = self._handle.engine
+        if not hasattr(engine, "iter_generate"):
+            context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                f"backend {self._handle.backend!r} cannot stream; "
+                "use the paged or speculative backend",
+            )
+
+        params = _params_from(request)
+        completion_tokens = 0
+
+        self._enter()
+        try:
+            for chunk in engine.iter_generate(
+                prompt=request.prompt,
+                max_tokens=request.max_tokens,
+                params=params,
+            ):
+                if chunk.token_id is not None:
+                    completion_tokens += 1
+                yield inference_pb2.GenerateResponse(
+                    text=chunk.text,
+                    finished=chunk.finished,
+                    request_id=request_id,
+                    prompt_tokens=chunk.prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    finish_reason=chunk.finish_reason or "",
+                )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+            logger.exception("stream failed request_id=%s", request_id)
+            context.abort(grpc.StatusCode.INTERNAL, f"generation failed: {exc}")
+        finally:
+            self._exit()
 
     def Health(self, request, context):  # noqa: N802 - gRPC naming
         return inference_pb2.HealthResponse(

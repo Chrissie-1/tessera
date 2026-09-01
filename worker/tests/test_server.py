@@ -40,6 +40,7 @@ class FakeHandle:
     config: WorkerConfig
     engine: object
     ready: bool = True
+    backend: str = "paged"
 
 
 class ExplodingEngine:
@@ -81,10 +82,11 @@ def test_request_id_is_generated_when_absent(servicer):
     assert response.request_id
 
 
-def test_streaming_is_rejected_until_phase_2(servicer):
-    assert abort_code(servicer, request(stream=True)) == (
-        grpc.StatusCode.INVALID_ARGUMENT
-    )
+def test_unary_generate_ignores_the_stream_flag(servicer):
+    """`stream` selects the RPC, not the behaviour of this one."""
+    response = servicer.Generate(request(stream=True), FakeContext())
+
+    assert response.finished is True
 
 
 @pytest.mark.parametrize("max_tokens", [0, -1])
@@ -179,3 +181,81 @@ def test_health_reports_not_ready_before_load(config, engine):
     servicer = InferenceServicer(FakeHandle(config=config, engine=engine, ready=False))
 
     assert servicer.Health(inference_pb2.HealthRequest(), FakeContext()).ready is False
+
+
+# -- streaming ---------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def streaming_servicer(config):
+    from tessera_worker.paged_engine import PagedEngine
+
+    engine = PagedEngine(config, num_blocks=128, block_size=8)
+    return InferenceServicer(FakeHandle(config=config, engine=engine))
+
+
+def collect(servicer, req):
+    return list(servicer.GenerateStream(req, FakeContext()))
+
+
+def test_stream_emits_a_message_per_token(streaming_servicer):
+    messages = collect(streaming_servicer, request(max_tokens=5))
+
+    assert len([m for m in messages if m.text]) <= 5
+    assert messages[-1].finished is True
+    assert messages[-1].finish_reason in {"length", "stop"}
+
+
+def test_only_the_last_stream_message_is_final(streaming_servicer):
+    messages = collect(streaming_servicer, request(max_tokens=4))
+
+    assert all(not m.finished for m in messages[:-1])
+
+
+def test_stream_deltas_reassemble_into_the_completion(streaming_servicer, engine):
+    """Concatenated deltas must equal what unary decoding returns."""
+    messages = collect(streaming_servicer, request(max_tokens=6, request_id="s1"))
+    streamed = "".join(m.text for m in messages)
+
+    expected = engine.generate("The capital of France is", max_tokens=6)
+    assert streamed == expected.text
+
+
+def test_stream_echoes_request_id_on_every_message(streaming_servicer):
+    messages = collect(streaming_servicer, request(max_tokens=3, request_id="abc"))
+
+    assert {m.request_id for m in messages} == {"abc"}
+
+
+def test_stream_reports_growing_completion_tokens(streaming_servicer):
+    counts = [
+        m.completion_tokens for m in collect(streaming_servicer, request(max_tokens=4))
+    ]
+
+    assert counts == sorted(counts)
+    assert counts[-1] <= 4
+
+
+def test_stream_validates_like_unary(streaming_servicer, config):
+    with pytest.raises(AbortedError) as excinfo:
+        collect(streaming_servicer, request(max_tokens=config.max_tokens_cap + 1))
+
+    assert excinfo.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_stream_releases_in_flight(streaming_servicer):
+    collect(streaming_servicer, request(max_tokens=3))
+
+    assert streaming_servicer.in_flight == 0
+
+
+def test_stream_rejects_a_backend_that_cannot_stream(config, engine):
+    """The reference engine has no iter_generate; that must be UNIMPLEMENTED."""
+    servicer = InferenceServicer(
+        FakeHandle(config=config, engine=engine, backend="reference")
+    )
+
+    with pytest.raises(AbortedError) as excinfo:
+        list(servicer.GenerateStream(request(), FakeContext()))
+
+    assert excinfo.value.code == grpc.StatusCode.UNIMPLEMENTED
