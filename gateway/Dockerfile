@@ -1,5 +1,10 @@
 # Build stage: needs protoc because tonic-build compiles the proto at build time.
-FROM rust:1.83-slim AS builder
+#
+# The pin has to stay ahead of what the lockfile's transitive dependencies
+# require. hashbrown 0.17 uses edition 2024, which cargo cannot even parse
+# before 1.85 -- on 1.83 the build failed at "failed to parse manifest" while
+# CI stayed green, because the CI job resolves `stable` rather than this pin.
+FROM rust:1.98.0-slim AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler pkg-config \

@@ -123,8 +123,9 @@ volume so a rebuild does not refetch it. The stack serves with
 
 ### From source
 
-Requirements: Python 3.10+, Rust (the gateway image builds on 1.83; `protoc` is
-needed to compile the proto). CUDA and Triton are optional and only used by the
+Requirements: Python 3.10+, Rust 1.85 or newer (the lockfile pulls in an
+edition-2024 crate; the gateway image pins 1.98). `protoc` is needed to
+compile the proto. CUDA and Triton are optional and only used by the
 GPU-marked tests and `bench/attention.py`.
 
 ```bash

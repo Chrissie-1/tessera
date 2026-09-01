@@ -17,9 +17,9 @@ do not "fix" it by loosening an equivalence assertion.
 
 ## Setup
 
-Requirements: Python 3.10+ and Rust (with `protoc` available — `tonic-build`
-compiles the proto during `cargo build`). CUDA and Triton are optional and only
-needed for the GPU-marked tests and `bench/attention.py`.
+Requirements: Python 3.10+ and Rust 1.85 or newer, with `protoc` available —
+`tonic-build` compiles the proto during `cargo build`. CUDA and Triton are
+optional and only needed for the GPU-marked tests and `bench/attention.py`.
 
 ```bash
 git clone https://github.com/Chrissie-1/tessera.git
