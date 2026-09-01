@@ -13,10 +13,13 @@ own argmax -- so a bad drafter costs throughput and never accuracy. The tests
 enforce that by running a deliberately wrong drafter and still demanding output
 identical to the reference engine.
 
-Sampling is a different matter: preserving the target's distribution requires
-the drafter's probabilities and a corrected residual to draw from on rejection.
-Until that is implemented, non-greedy requests fall back to ordinary paged
-decoding rather than quietly changing the distribution they sample from.
+Sampling is exact too, by a different argument. A proposal drawn from the
+drafter's q is accepted with probability min(1, p/q), and a rejection is
+resolved by drawing from the normalised residual max(0, p - q). Those two steps
+compose to exactly p, so the tokens are distributed as though the target model
+had sampled them alone. That requires the drafter to report the distribution it
+sampled from; a drafter that cannot falls back to ordinary paged decoding
+rather than quietly sampling from the wrong distribution.
 """
 
 from __future__ import annotations
@@ -30,7 +33,13 @@ import torch
 from .config import WorkerConfig
 from .paged import DEFAULT_BLOCK_SIZE, DEFAULT_NUM_BLOCKS
 from .paged_engine import PagedEngine, StreamChunk
-from .sampling import SamplingParams
+from .sampling import (
+    SamplingParams,
+    logits_to_probs,
+    make_generator,
+    residual_probs,
+    sample_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +51,28 @@ class Drafter(Protocol):
 
     def propose(self, context_ids: list[int], k: int) -> list[int]:
         """Return up to `k` proposed token ids following `context_ids`."""
+
+
+class SamplingDrafter(Drafter, Protocol):
+    """A drafter that can also report what it sampled from.
+
+    Speculative *sampling* needs the proposal distribution, not just the
+    proposal: the acceptance test is a ratio against it. A drafter that cannot
+    supply one can still be used for greedy decoding.
+    """
+
+    def propose_with_probs(
+        self,
+        context_ids: list[int],
+        k: int,
+        params: SamplingParams,
+        generator: torch.Generator | None = None,
+    ) -> tuple[list[int], list[torch.Tensor]]:
+        """Return proposals and the (vocab,) distribution each was drawn from.
+
+        `generator` is threaded through so a seeded request stays reproducible
+        across the draft as well as the verification.
+        """
 
 
 class ModelDrafter:
@@ -64,6 +95,35 @@ class ModelDrafter:
             proposed.append(token)
             context.append(token)
         return proposed
+
+    @torch.inference_mode()
+    def propose_with_probs(
+        self,
+        context_ids: list[int],
+        k: int,
+        params: SamplingParams,
+        generator: torch.Generator | None = None,
+    ) -> tuple[list[int], list[torch.Tensor]]:
+        """Draw `k` proposals from the drafter's own sampling distribution.
+
+        The returned distribution is the one actually sampled from -- after
+        temperature and top-p -- because that is the q the acceptance ratio is
+        defined against. Reporting the raw softmax instead would silently break
+        the distributional guarantee.
+        """
+        proposed: list[int] = []
+        distributions: list[torch.Tensor] = []
+        context = list(context_ids)
+        for _ in range(k):
+            logits = self.engine.forward_logits(context)
+            probs = logits_to_probs(logits, params)
+            token = int(
+                torch.multinomial(probs, num_samples=1, generator=generator).item()
+            )
+            proposed.append(token)
+            distributions.append(probs)
+            context.append(token)
+        return proposed, distributions
 
 
 class SpeculativeEngine(PagedEngine):
@@ -107,9 +167,9 @@ class SpeculativeEngine(PagedEngine):
         params: SamplingParams | None = None,
     ) -> Iterator[StreamChunk]:
         params = params or SamplingParams()
-        if not params.greedy:
-            # Exact speculative sampling is not implemented; decode normally
-            # rather than silently sampling from the wrong distribution.
+        if not params.greedy and not hasattr(self.drafter, "propose_with_probs"):
+            # Without the proposal distribution the acceptance ratio is
+            # undefined, so speculating would change what is sampled.
             yield from super().iter_generate(prompt, max_tokens, params)
             return
 
@@ -123,6 +183,7 @@ class SpeculativeEngine(PagedEngine):
 
         emitted: list[int] = []
         finish_reason = "length"
+        generator = make_generator(self.config.device, params.seed)
         seq_id = self._new_sequence_id()
         self.cache.add_sequence(seq_id)
 
@@ -136,7 +197,7 @@ class SpeculativeEngine(PagedEngine):
 
             # `pending` is the emitted token whose keys and values are not in
             # the cache yet; it leads the next verification pass.
-            pending = int(torch.argmax(outputs.logits[0, -1, :], dim=-1).item())
+            pending = sample_token(outputs.logits[0, -1, :], params, generator)
             if pending == self.eos_token_id or budget == 0:
                 finish_reason = "stop" if budget else "length"
                 yield self._final(prompt_tokens, finish_reason)
@@ -145,7 +206,15 @@ class SpeculativeEngine(PagedEngine):
             while True:
                 context = prompt_ids + emitted
                 k = min(self.lookahead, budget - len(emitted) - 1)
-                drafts = self.drafter.propose(context + [pending], k) if k > 0 else []
+                draft_probs: list[torch.Tensor] = []
+                if k <= 0:
+                    drafts = []
+                elif params.greedy:
+                    drafts = self.drafter.propose(context + [pending], k)
+                else:
+                    drafts, draft_probs = self.drafter.propose_with_probs(
+                        context + [pending], k, params, generator
+                    )
                 cached_len = self.cache.length(seq_id)
                 step_ids = [pending, *drafts]
                 outputs = self.model(
@@ -171,9 +240,15 @@ class SpeculativeEngine(PagedEngine):
                     # the rate reflects proposals actually judged -- a round cut
                     # short by the token budget skews neither counter.
                     self.proposed_tokens += 1
-                    target = int(torch.argmax(logits[i], dim=-1).item())
-                    if target != draft:
-                        nxt = target
+                    keep, replacement = self._judge(
+                        logits[i],
+                        draft,
+                        draft_probs[i] if draft_probs else None,
+                        params,
+                        generator,
+                    )
+                    if not keep:
+                        nxt = replacement
                         break
                     accepted += 1
                     self.accepted_tokens += 1
@@ -184,7 +259,7 @@ class SpeculativeEngine(PagedEngine):
                 else:
                     # Every proposal held, so the pass also produced a token
                     # beyond them for free.
-                    nxt = int(torch.argmax(logits[len(drafts)], dim=-1).item())
+                    nxt = sample_token(logits[len(drafts)], params, generator)
 
                 # Drop the keys and values of proposals that were rejected:
                 # the pass wrote all of them, only the accepted prefix counts.
@@ -197,6 +272,50 @@ class SpeculativeEngine(PagedEngine):
                 pending = nxt
         finally:
             self.cache.free_sequence(seq_id)
+
+    def _judge(
+        self,
+        target_logits: torch.Tensor,
+        draft: int,
+        draft_probs: torch.Tensor | None,
+        params: SamplingParams,
+        generator: torch.Generator | None,
+    ) -> tuple[bool, int]:
+        """Decide whether to keep one proposal, and what to emit if not.
+
+        Greedy keeps a proposal only when it is the target's argmax, which is
+        a hard equality. Sampling keeps it with probability min(1, p/q) and
+        resolves a rejection from the residual, which is what preserves the
+        target distribution rather than merely approximating it.
+        """
+        if params.greedy:
+            target = int(torch.argmax(target_logits, dim=-1).item())
+            return target == draft, target
+
+        p = logits_to_probs(target_logits, params)
+        q = draft_probs
+        # A token the draft could never have proposed cannot be accepted; the
+        # ratio is unbounded, so treat it as an outright rejection.
+        q_draft = float(q[draft]) if q is not None else 0.0
+        if q_draft <= 0.0:
+            return False, int(
+                torch.multinomial(
+                    residual_probs(p, q) if q is not None else p,
+                    num_samples=1,
+                    generator=generator,
+                ).item()
+            )
+
+        ratio = float(p[draft]) / q_draft
+        roll = torch.rand(1, generator=generator, device=p.device).item()
+        if roll < min(1.0, ratio):
+            return True, draft
+
+        return False, int(
+            torch.multinomial(
+                residual_probs(p, q), num_samples=1, generator=generator
+            ).item()
+        )
 
     def _emit(
         self,

@@ -9,6 +9,7 @@ from tessera_worker.sampling import (
     apply_top_p,
     logits_to_probs,
     make_generator,
+    residual_probs,
     sample_token,
 )
 
@@ -65,3 +66,45 @@ def test_greedy_rejects_probability_conversion():
 
     with pytest.raises(ValueError):
         logits_to_probs(torch.randn(8), SamplingParams(temperature=0.0))
+
+
+def test_residual_keeps_only_what_the_draft_under_covered():
+    target = torch.tensor([0.5, 0.3, 0.2])
+    draft = torch.tensor([0.1, 0.6, 0.3])
+
+    residual = residual_probs(target, draft)
+
+    # The draft over-covered tokens 1 and 2, so only token 0 has mass left.
+    assert residual[0] == 1.0
+    assert residual[1] == 0.0
+    assert residual[2] == 0.0
+
+
+def test_residual_is_normalised():
+    target = torch.tensor([0.4, 0.4, 0.2])
+    draft = torch.tensor([0.1, 0.1, 0.8])
+
+    residual = residual_probs(target, draft)
+
+    assert torch.isclose(residual.sum(), torch.tensor(1.0))
+    assert (residual >= 0).all()
+
+
+def test_residual_falls_back_to_the_target_when_fully_covered():
+    """p == q leaves no residual mass; the fallback must still be a distribution."""
+    probs = torch.tensor([0.6, 0.4])
+
+    residual = residual_probs(probs, probs)
+
+    assert torch.isclose(residual.sum(), torch.tensor(1.0))
+    assert torch.equal(residual, probs)
+
+
+def test_residual_ignores_draft_mass_beyond_the_target():
+    target = torch.tensor([1.0, 0.0])
+    draft = torch.tensor([0.5, 0.5])
+
+    residual = residual_probs(target, draft)
+
+    assert residual[0] == 1.0
+    assert residual[1] == 0.0

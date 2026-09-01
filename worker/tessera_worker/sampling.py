@@ -83,6 +83,32 @@ def sample_token(
     return int(torch.multinomial(probs, num_samples=1, generator=generator).item())
 
 
+def residual_probs(target: torch.Tensor, draft: torch.Tensor) -> torch.Tensor:
+    """The distribution to draw from when a speculative proposal is rejected.
+
+    Speculative sampling accepts a proposal x with probability
+    min(1, target(x) / draft(x)). For the tokens the target model likes more
+    than the drafter did, that acceptance test alone would under-represent
+    them, so a rejection must be resolved by sampling from the part of the
+    target distribution the draft failed to cover: normalised max(0, p - q).
+    Together the two steps reproduce `target` exactly.
+
+    Args:
+        target: (vocab,) the distribution the model actually wants.
+        draft: (vocab,) the distribution the proposal was drawn from.
+
+    Returns:
+        (vocab,) normalised residual. Falls back to `target` when the residual
+        has no mass left, which happens only when the draft covered the target
+        completely and rejection was therefore impossible.
+    """
+    residual = torch.clamp(target - draft, min=0.0)
+    total = residual.sum()
+    if total <= 0:
+        return target
+    return residual / total
+
+
 def make_generator(device: str, seed: int | None) -> torch.Generator | None:
     """Build a seeded RNG on `device`, or None when the caller wants entropy."""
     if seed is None:

@@ -9,6 +9,7 @@ draft quality could change the answer, the verification step would be wrong.
 from __future__ import annotations
 
 import pytest
+import torch
 
 from tessera_worker.sampling import SamplingParams
 from tessera_worker.speculative import ModelDrafter, SpeculativeEngine
@@ -152,18 +153,109 @@ def test_only_the_last_chunk_is_final(speculative):
     assert all(not c.finished for c in chunks[:-1])
 
 
-# -- sampling fallback ------------------------------------------------------
+# -- speculative sampling ----------------------------------------------------
 
 
-def test_sampling_falls_back_to_paged_decoding(config, engine):
-    """Non-greedy must not be silently re-distributed by speculation."""
+def test_sampling_falls_back_without_proposal_probabilities(config, engine):
+    """A drafter that cannot report q leaves the acceptance ratio undefined."""
     params = SamplingParams(temperature=1.0, top_p=0.9, seed=5)
-    spec = SpeculativeEngine(config, lookahead=4, num_blocks=256, block_size=8)
+    spec = SpeculativeEngine(
+        config, drafter=WrongDrafter(), lookahead=4, num_blocks=256, block_size=8
+    )
 
     expected = engine.generate("Once upon a time", max_tokens=6, params=params)
     actual = spec.generate("Once upon a time", max_tokens=6, params=params)
 
     assert actual.token_ids == expected.token_ids
+
+
+def test_sampling_speculates_when_the_drafter_reports_probabilities(config):
+    """The default drafter can report q, so sampling should not fall back."""
+    params = SamplingParams(temperature=1.0, top_p=1.0, seed=5)
+    spec = SpeculativeEngine(config, lookahead=4, num_blocks=256, block_size=8)
+    spec.generate("Once upon a time", max_tokens=8, params=params)
+
+    assert spec.proposed_tokens > 0
+
+
+def test_sampling_is_reproducible_under_a_seed(config):
+    params = SamplingParams(temperature=1.0, top_p=0.9, seed=99)
+
+    first = SpeculativeEngine(config, lookahead=3, num_blocks=256, block_size=8)
+    second = SpeculativeEngine(config, lookahead=3, num_blocks=256, block_size=8)
+
+    assert (
+        first.generate("Hello world", max_tokens=6, params=params).token_ids
+        == second.generate("Hello world", max_tokens=6, params=params).token_ids
+    )
+
+
+def test_accepted_tokens_never_exceed_proposed(speculative):
+    speculative.generate("Hello world", max_tokens=8)
+
+    assert speculative.accepted_tokens <= speculative.proposed_tokens
+
+
+def test_judge_reproduces_the_target_distribution(config):
+    """The guarantee: accept-or-residual composes to exactly the target p.
+
+    Driven with synthetic distributions rather than the model, so the only
+    thing under test is the acceptance rule. A drafter deliberately skewed
+    away from the target makes rejection the common path.
+    """
+    spec = SpeculativeEngine(config, lookahead=1, num_blocks=32, block_size=8)
+
+    target = torch.tensor([0.5, 0.3, 0.15, 0.05])
+    draft = torch.tensor([0.1, 0.2, 0.3, 0.4])
+    # softmax(log p) == p, so the engine sees exactly `target`.
+    logits = torch.log(target)
+    params = SamplingParams(temperature=1.0, top_p=1.0)
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(1234)
+
+    trials = 20000
+    counts = torch.zeros(4)
+    proposals = torch.multinomial(
+        draft, num_samples=trials, replacement=True, generator=generator
+    )
+    for proposal in proposals.tolist():
+        keep, replacement = spec._judge(logits, proposal, draft, params, generator)
+        counts[proposal if keep else replacement] += 1
+
+    empirical = counts / trials
+    assert torch.allclose(empirical, target, atol=0.02), empirical
+
+
+def test_judge_accepts_everything_when_draft_matches_target(config):
+    """p == q makes the ratio 1, so nothing should ever be rejected."""
+    spec = SpeculativeEngine(config, lookahead=1, num_blocks=32, block_size=8)
+
+    probs = torch.tensor([0.4, 0.3, 0.2, 0.1])
+    params = SamplingParams(temperature=1.0, top_p=1.0)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(7)
+
+    for token in range(4):
+        keep, _ = spec._judge(torch.log(probs), token, probs, params, generator)
+        assert keep
+
+
+def test_judge_rejects_a_token_the_draft_could_not_propose(config):
+    """q(x) == 0 makes the ratio unbounded; it must not be accepted."""
+    spec = SpeculativeEngine(config, lookahead=1, num_blocks=32, block_size=8)
+
+    target = torch.tensor([0.25, 0.25, 0.25, 0.25])
+    draft = torch.tensor([0.5, 0.5, 0.0, 0.0])
+    params = SamplingParams(temperature=1.0, top_p=1.0)
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(3)
+
+    keep, replacement = spec._judge(torch.log(target), 2, draft, params, generator)
+
+    assert keep is False
+    # The residual has mass only where the draft under-covered the target.
+    assert replacement in {2, 3}
 
 
 # -- cache hygiene ----------------------------------------------------------
