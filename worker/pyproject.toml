@@ -6,6 +6,25 @@ build-backend = "setuptools.build_meta"
 name = "tessera-worker"
 version = "0.1.0"
 description = "Tessera inference worker: paged KV cache, continuous batching, speculative decoding"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Chrissie Raj"},
+]
+keywords = ["inference", "llm", "ml", "gpu", "batching", "speculative-decoding"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.4",
@@ -13,10 +32,9 @@ dependencies = [
     "grpcio>=1.60",
     "protobuf>=4.25",
     "fastapi>=0.110",
+    # uvicorn is a console script (see `make run-api`), not an import.
     "uvicorn>=0.29",
     "pydantic>=2.6",
-    "numpy>=1.26",
-    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +51,11 @@ dev = [
     "ruff>=0.5",
     "black>=24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Chrissie-1/tessera"
+Repository = "https://github.com/Chrissie-1/tessera"
+Issues = "https://github.com/Chrissie-1/tessera/issues"
 
 [project.scripts]
 tessera-worker = "tessera_worker.server:serve"

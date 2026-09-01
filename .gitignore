@@ -11,6 +11,10 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
+# Python build artefacts
+build/
+dist/
+
 # Generated gRPC stubs (regenerate with scripts/gen_proto.sh)
 worker/tessera_worker/generated/*.py
 worker/tessera_worker/generated/*.pyi

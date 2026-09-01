@@ -1,0 +1,109 @@
+name: Release
+
+# Tags matching v* cut a GitHub release and attach the built artifacts.
+#
+# This workflow deliberately does NOT publish to PyPI or push container images
+# to any registry. Publishing to a public registry is irreversible -- a PyPI
+# name cannot be reused once claimed -- so it stays a conscious, manual act.
+# RELEASING.md documents how to do it, and what to add here if you decide you
+# want it automated.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e "worker[dev]"
+
+      - name: Generate gRPC stubs
+        run: ./scripts/gen_proto.sh
+
+      - name: Check the tag matches the declared version
+        # A tag that disagrees with the manifests produces a release nobody can
+        # reproduce, so fail before anything is published.
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          CARGO=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          PY=$(grep -m1 '^version = ' worker/pyproject.toml | cut -d'"' -f2)
+          echo "tag=$TAG cargo=$CARGO python=$PY"
+          test "$TAG" = "$CARGO" || { echo "::error::tag $TAG != Cargo.toml $CARGO"; exit 1; }
+          test "$TAG" = "$PY"    || { echo "::error::tag $TAG != pyproject.toml $PY"; exit 1; }
+
+      - name: Test
+        run: |
+          (cd worker && python -m pytest -q)
+          cargo test --all
+
+      - name: Build the Python distribution
+        run: |
+          pip install build twine
+          cd worker && python -m build && python -m twine check dist/*
+
+      - name: Build the container images
+        # Built to prove they still build. Not pushed anywhere.
+        run: docker compose build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: worker/dist/*
+
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    needs: verify
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Extract the changelog section for this tag
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          # Everything between this version's heading and the next one.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/         { exit }
+            on                     { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "No CHANGELOG.md section for $VERSION." > notes.md
+          fi
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: dist/*
+          draft: false
+          prerelease: false

@@ -1,0 +1,7 @@
+# Keep line endings LF in the repo, matching .editorconfig.
+* text=auto eol=lf
+
+# Generated and binary content
+*.png binary
+*.pt binary
+*.safetensors binary

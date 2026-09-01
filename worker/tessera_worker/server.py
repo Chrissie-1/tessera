@@ -32,10 +32,11 @@ def _params_from(request) -> SamplingParams:
 class InferenceServicer(inference_pb2_grpc.InferenceServicer):
     """Translates gRPC messages into engine calls.
 
-    Requests run on a thread pool, one decode per call. The continuous
-    batching scheduler in `batching.py` is what shares a single forward pass
-    across concurrent sequences; wiring it in behind this interface is a
-    deployment change, not a protocol one.
+    Requests run on a thread pool, one call per decode. Whether those decodes
+    share forward passes is the engine's business, not this class's: the
+    `batched` backend merges them through the scheduler in `batching.py`,
+    while `reference`, `paged` and `speculative` decode one sequence at a
+    time. Selecting between them is a deployment change, not a protocol one.
     """
 
     def __init__(self, handle: EngineHandle) -> None:
@@ -121,7 +122,7 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
             context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
                 f"backend {self._handle.backend!r} cannot stream; "
-                "use the paged or speculative backend",
+                "use the paged, batched or speculative backend",
             )
 
         params = _params_from(request)
@@ -192,6 +193,12 @@ def serve(config: WorkerConfig | None = None) -> None:
 
     logger.info("shutting down")
     server.stop(grace=5).wait()
+
+    # The batched backend owns a scheduler thread. Stopping the gRPC server
+    # does not stop it, so ask the engine to close if it knows how.
+    close = getattr(handle.engine if handle.ready else None, "close", None)
+    if callable(close):
+        close()
 
 
 if __name__ == "__main__":

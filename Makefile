@@ -10,7 +10,7 @@ CARGO_TARGET_DIR ?= $(HOME)/.cache/tessera-target
 export CARGO_TARGET_DIR
 
 .DEFAULT_GOAL := help
-.PHONY: help venv install proto test test-py test-rs lint fmt run-worker run-api run-gateway docker-build docker-up docker-down clean
+.PHONY: help venv install proto test test-py test-rs lint fmt run-worker run-api run-gateway docker-build docker-up docker-down clean validate-release release
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -66,3 +66,21 @@ docker-down: ## Tear down the stack and its volumes
 clean: ## Remove build artefacts and caches
 	rm -rf $(CARGO_TARGET_DIR) worker/.pytest_cache worker/*.egg-info
 	find worker -name __pycache__ -type d -exec rm -rf {} +
+
+validate-release: ## Validate the project is ready for release
+	@chmod +x scripts/validate-release.sh
+	./scripts/validate-release.sh
+
+release: validate-release test lint ## Run all checks and prepare for release
+	@echo "✓ All checks passed!"
+	@echo ""
+	@echo "Next steps to create a release:"
+	@echo "  1. Update version in Cargo.toml and worker/pyproject.toml"
+	@echo "  2. Update CHANGELOG.md with the new version section"
+	@echo "  3. Commit: git add Cargo.toml worker/pyproject.toml CHANGELOG.md && git commit -m 'chore: release v0.X.Y'"
+	@echo "  4. Tag: git tag -a v0.X.Y -m 'Release version 0.X.Y'"
+	@echo "  5. Push: git push origin master && git push origin v0.X.Y"
+	@echo ""
+	@echo "The release workflow then verifies the tag, runs both test suites,"
+	@echo "builds the artifacts and cuts a GitHub release. It does NOT publish"
+	@echo "to PyPI or any container registry -- see RELEASING.md."

@@ -1,0 +1,5 @@
+include README.md
+include tessera_worker/py.typed
+recursive-include tessera_worker/generated *.py *.pyi
+recursive-exclude * __pycache__
+recursive-exclude * *.py[cod]
