@@ -3,8 +3,9 @@
 A single indirection point so that later phases can swap the execution backend
 (paged KV cache, speculative decoding) without touching the gRPC or HTTP
 layers. "reference" is the dense engine that defines correctness; "paged"
-adds the Phase 2 block cache and "speculative" the Phase 3 draft-and-verify
-loop. Both are asserted to match the reference token for token.
+adds the Phase 2 block cache, "batched" serves many requests through one
+continuous-batching loop, and "speculative" adds the Phase 3 draft-and-verify
+loop. All are asserted to match the reference token for token.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import os
 from .config import WorkerConfig
 from .model import ReferenceEngine
 from .paged_engine import PagedEngine
+from .serving import BatchedEngine
 from .speculative import SpeculativeEngine
 
 logger = logging.getLogger(__name__)
@@ -23,6 +25,7 @@ BACKENDS = {
     "reference": ReferenceEngine,
     "paged": PagedEngine,
     "speculative": SpeculativeEngine,
+    "batched": BatchedEngine,
 }
 DEFAULT_BACKEND = "reference"
 

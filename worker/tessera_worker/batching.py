@@ -71,6 +71,7 @@ class StepOutput:
     request_id: str
     token_id: int | None
     text: str
+    prompt_tokens: int
     finished: bool
     finish_reason: str | None
 
@@ -262,6 +263,7 @@ class ContinuousBatcher:
             request_id=sequence.request_id,
             token_id=token,
             text=self.engine.tokenizer.decode([token]) if token is not None else "",
+            prompt_tokens=sequence.prompt_tokens,
             finished=sequence.done,
             finish_reason=sequence.finish_reason,
         )
