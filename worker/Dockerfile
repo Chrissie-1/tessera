@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir \
 
 COPY worker/pyproject.toml /app/pyproject.toml
 RUN pip install --no-cache-dir \
-    "transformers>=4.44" "grpcio>=1.60" "grpcio-tools>=1.60" "protobuf>=4.25" \
+    "transformers>=5.0" "grpcio>=1.60" "grpcio-tools>=1.60" "protobuf>=4.25" \
     "fastapi>=0.110" "uvicorn>=0.29" "pydantic>=2.6"
 
 COPY proto /app/proto

@@ -27,8 +27,13 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.4",
-    "transformers>=4.44",
+    # transformers 5.0 is a hard floor, not caution: the engines read
+    # `past_key_values.layers[i].keys`, and before v5 a forward pass returned a
+    # legacy tuple. On 4.54 the paged tests fail with
+    # "'tuple' object has no attribute 'layers'".
+    # torch 2.5 is what transformers 5.x expects and what the image pins.
+    "torch>=2.5",
+    "transformers>=5.0",
     "grpcio>=1.60",
     "protobuf>=4.25",
     "fastapi>=0.110",
