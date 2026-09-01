@@ -118,7 +118,8 @@ curl -X POST http://localhost:8080/v1/completions \
 ```
 
 The worker downloads `gpt2` on first start; the HF cache is kept in a named
-volume so a rebuild does not refetch it.
+volume so a rebuild does not refetch it. The stack serves with
+`TESSERA_BACKEND=batched`, so concurrent requests share forward passes.
 
 ### From source
 
@@ -213,8 +214,8 @@ gateway uses for routing).
 
 `tessera_worker.api` is a small FastAPI app for poking at the worker without
 the gateway (`make run-api`, port 8000). It exposes `GET /health` and
-`POST /v1/completions` — unary only, no streaming. It is a debugging surface,
-not the production path.
+`POST /v1/completions`, including `"stream": true`, which emits the same SSE
+shape the gateway does. It is a debugging surface, not the production path.
 
 ## Configuration
 
@@ -241,24 +242,30 @@ not the production path.
 | `TESSERA_MAX_TOKENS_CAP` | `512` | Largest accepted `max_tokens` |
 | `TESSERA_THREADS` | `8` | gRPC server thread-pool size |
 | `TESSERA_LOG_LEVEL` | `INFO` | Python logging level |
+| `TESSERA_MAX_BATCH_SIZE` | `8` | Sequences the `batched` scheduler runs concurrently |
+| `TESSERA_NUM_BLOCKS` | `512` | Blocks in the paged KV pool |
+| `TESSERA_BLOCK_SIZE` | `16` | Tokens per block |
+| `TESSERA_LOOKAHEAD` | `4` | Tokens the `speculative` drafter proposes per round |
 
 `float32` is the default dtype on purpose: the paged-vs-dense equivalence tests
 compare logits, and fp16 accumulation differences would put "identical" out of
 reach.
 
-Batch size, block count, and block size are constructor arguments
-(`max_batch_size=8`, `num_blocks=512`, `block_size=16`) and are not currently
-read from the environment.
+Every engine still accepts these as constructor arguments, and an explicit
+argument wins over the configured value.
 
 ## Supported models
 
-Tested against `sshleifer/tiny-gpt2` (the test suite) and `gpt2` (the default).
+Tested end to end against `sshleifer/tiny-gpt2` (the test suite) and `gpt2`
+(the default).
 
-**GPT-2 family only, in practice.** `PagedEngine` reads `model.config.n_layer`
-and `max_position_embeddings` reads `n_positions`, both of which are GPT-2
-naming. Llama-style configs (`num_hidden_layers`, `max_position_embeddings`)
-will raise `AttributeError` on load. Supporting them is a config-mapping change,
-not an architectural one, but it has not been done.
+Layer count and position limits are resolved through whichever attribute names
+an architecture uses, so GPT-2, Llama, Mistral and OPT-style configs all load.
+That resolution is unit-tested across those config classes; what is *not*
+claimed is that any given large model has been run end to end here, because it
+has not. Decoding is architecture-agnostic beyond this point -- the cache stores
+whatever key/value shapes the model produces -- but treat a new family as
+unverified until you have run it.
 
 ## Development
 
@@ -325,9 +332,10 @@ small for the results to say anything about real serving.
 ## Limitations
 
 - The Triton paged-attention kernel is validated but **not wired into decoding**.
-- GPT-2-family configs only (see [Supported models](#supported-models)).
-- `docker compose --scale worker=N` will not work as-is: the worker publishes a
-  fixed host port, and the gateway's endpoint list is static.
+- `docker compose --scale worker=N` starts N workers, but Compose gives them a
+  single DNS name, so the gateway spreads load by name resolution rather than by
+  its own least-in-flight accounting. For true per-worker routing, list the
+  endpoints explicitly in `TESSERA_WORKER_ENDPOINTS`.
 - No metrics endpoint, no authentication, no TLS, no request timeouts beyond the
   gRPC client's 300s ceiling.
 - Single process per worker; no multi-GPU, quantisation, prefix caching, or

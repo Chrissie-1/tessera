@@ -139,13 +139,17 @@ dependency you don't import.
 
 ## Good first issues
 
-- Map non-GPT-2 model configs (`num_hidden_layers` / `max_position_embeddings`)
-  so Llama- and Mistral-style models load.
-- Wire the Triton paged-attention kernel into the decode path — it is written
-  and tested but unused.
-- Make block count, block size, and batch size configurable from the
-  environment rather than constructor defaults.
-- Add streaming to the FastAPI dev wrapper; the engines already support it.
+- **Wire the Triton paged-attention kernel into the decode path.** It is
+  written, tested against the PyTorch reference, and completely unused. This is
+  the biggest open item and needs a CUDA machine to validate — the kernel's own
+  tests skip without one, so a change here cannot be trusted on CI alone.
+- **Run a non-GPT-2 model end to end.** Config resolution handles Llama- and
+  Mistral-style naming and is unit-tested, but no large model has actually been
+  decoded here. Expect to find gaps in grouped-query attention handling.
+- **Give the gateway real per-replica routing under Compose.** Least-in-flight
+  accounting currently sees one DNS name, not N workers.
+- **Add a metrics endpoint.** Queue depth, cache utilisation, batch occupancy
+  and speculative acceptance rate are all already computed and thrown away.
 
 ## Releasing
 

@@ -31,7 +31,6 @@ from typing import Protocol
 import torch
 
 from .config import WorkerConfig
-from .paged import DEFAULT_BLOCK_SIZE, DEFAULT_NUM_BLOCKS
 from .paged_engine import PagedEngine, StreamChunk
 from .sampling import (
     SamplingParams,
@@ -42,8 +41,6 @@ from .sampling import (
 )
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_LOOKAHEAD = 4
 
 
 class Drafter(Protocol):
@@ -138,11 +135,12 @@ class SpeculativeEngine(PagedEngine):
         self,
         config: WorkerConfig,
         drafter: Drafter | None = None,
-        lookahead: int = DEFAULT_LOOKAHEAD,
-        num_blocks: int = DEFAULT_NUM_BLOCKS,
-        block_size: int = DEFAULT_BLOCK_SIZE,
+        lookahead: int | None = None,
+        num_blocks: int | None = None,
+        block_size: int | None = None,
     ) -> None:
         super().__init__(config, num_blocks=num_blocks, block_size=block_size)
+        lookahead = lookahead if lookahead is not None else config.lookahead
         if lookahead <= 0:
             raise ValueError("lookahead must be positive")
         self.lookahead = lookahead

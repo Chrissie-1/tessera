@@ -24,9 +24,9 @@ from dataclasses import dataclass
 import torch
 from transformers.cache_utils import DynamicCache
 
-from .config import WorkerConfig
+from .config import WorkerConfig, num_layers
 from .model import GenerationResult, ReferenceEngine
-from .paged import DEFAULT_BLOCK_SIZE, DEFAULT_NUM_BLOCKS, PagedKVCache
+from .paged import PagedKVCache
 from .sampling import SamplingParams, make_generator, sample_token
 
 logger = logging.getLogger(__name__)
@@ -53,12 +53,16 @@ class PagedEngine(ReferenceEngine):
     def __init__(
         self,
         config: WorkerConfig,
-        num_blocks: int = DEFAULT_NUM_BLOCKS,
-        block_size: int = DEFAULT_BLOCK_SIZE,
+        num_blocks: int | None = None,
+        block_size: int | None = None,
     ) -> None:
         super().__init__(config)
+        # An explicit argument wins; otherwise take the configured value, which
+        # itself defaults to the module constant.
+        num_blocks = num_blocks if num_blocks is not None else config.num_blocks
+        block_size = block_size if block_size is not None else config.block_size
         self.cache = PagedKVCache(
-            num_layers=int(self.model.config.n_layer),
+            num_layers=num_layers(self.model.config),
             num_blocks=num_blocks,
             block_size=block_size,
             device=config.device,

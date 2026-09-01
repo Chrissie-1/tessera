@@ -28,13 +28,10 @@ from collections.abc import Iterator
 from .batching import ContinuousBatcher, Request
 from .config import WorkerConfig
 from .model import GenerationResult
-from .paged import DEFAULT_BLOCK_SIZE, DEFAULT_NUM_BLOCKS
 from .paged_engine import PagedEngine, StreamChunk
 from .sampling import SamplingParams
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_MAX_BATCH_SIZE = 8
 
 # How long the scheduler blocks waiting for work before looping. It only
 # bounds shutdown latency; arriving requests wake it immediately.
@@ -56,10 +53,13 @@ class BatchedEngine:
     def __init__(
         self,
         config: WorkerConfig,
-        max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
-        num_blocks: int = DEFAULT_NUM_BLOCKS,
-        block_size: int = DEFAULT_BLOCK_SIZE,
+        max_batch_size: int | None = None,
+        num_blocks: int | None = None,
+        block_size: int | None = None,
     ) -> None:
+        max_batch_size = (
+            max_batch_size if max_batch_size is not None else config.max_batch_size
+        )
         self.engine = PagedEngine(config, num_blocks=num_blocks, block_size=block_size)
         self.batcher = ContinuousBatcher(self.engine, max_batch_size=max_batch_size)
 

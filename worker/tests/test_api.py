@@ -7,6 +7,9 @@ behaviour -- that lives in test_model.py.
 
 from __future__ import annotations
 
+import json
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -99,3 +102,101 @@ def test_empty_prompt_is_accepted(client):
 
     assert response.status_code == 200
     assert response.json()["prompt_tokens"] >= 1
+
+
+# -- streaming ---------------------------------------------------------------
+#
+# The engines have produced tokens one at a time since Phase 2, but this
+# wrapper only ever exposed the accumulated result. These cover the SSE
+# surface, and the case where the configured backend cannot stream at all.
+
+
+@pytest.fixture(scope="module")
+def streaming_client(config):
+    """A client on the paged backend, which implements `iter_generate`."""
+    previous = os.environ.get("TESSERA_BACKEND")
+    os.environ["TESSERA_BACKEND"] = "paged"
+    try:
+        with TestClient(create_app(config)) as test_client:
+            yield test_client
+    finally:
+        if previous is None:
+            os.environ.pop("TESSERA_BACKEND", None)
+        else:
+            os.environ["TESSERA_BACKEND"] = previous
+
+
+def _events(response) -> list[str]:
+    """The `data:` payloads of an SSE body, in order."""
+    return [
+        line[len("data: ") :]
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def test_streaming_is_refused_when_the_backend_cannot_stream(client):
+    """The reference engine has no iter_generate; say so rather than crash."""
+    response = client.post(
+        "/v1/completions",
+        json={"prompt": "hi", "max_tokens": 4, "stream": True},
+    )
+
+    assert response.status_code == 400
+    assert "cannot stream" in response.json()["detail"]
+
+
+def test_streaming_returns_an_event_stream(streaming_client):
+    response = streaming_client.post(
+        "/v1/completions",
+        json={"prompt": "The capital of France is", "max_tokens": 4, "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+
+def test_stream_terminates_with_done(streaming_client):
+    response = streaming_client.post(
+        "/v1/completions",
+        json={"prompt": "Hello world", "max_tokens": 4, "stream": True},
+    )
+
+    events = _events(response)
+    assert events, "expected at least one event"
+    assert events[-1] == "[DONE]"
+
+
+def test_stream_chunks_carry_one_token_delta_each(streaming_client):
+    response = streaming_client.post(
+        "/v1/completions",
+        json={"prompt": "Hello world", "max_tokens": 3, "stream": True},
+    )
+
+    chunks = [json.loads(e) for e in _events(response) if e != "[DONE]"]
+    assert chunks, "expected token chunks"
+    for chunk in chunks:
+        assert chunk["object"] == "text_completion.chunk"
+        assert chunk["choices"][0]["index"] == 0
+        assert isinstance(chunk["choices"][0]["text"], str)
+
+    # Only the terminal chunk may report why generation stopped.
+    reasons = [c["choices"][0]["finish_reason"] for c in chunks]
+    assert all(r is None for r in reasons[:-1])
+    assert reasons[-1] in {"length", "stop"}
+
+
+def test_streamed_text_matches_the_unary_completion(streaming_client):
+    """Streaming must be a different delivery of the same tokens, not different
+    tokens: concatenating the deltas has to reproduce the unary body exactly."""
+    payload = {"prompt": "The capital of France is", "max_tokens": 6}
+
+    unary = streaming_client.post("/v1/completions", json=payload).json()
+    streamed = streaming_client.post(
+        "/v1/completions", json={**payload, "stream": True}
+    )
+
+    deltas = [
+        json.loads(e)["choices"][0]["text"] for e in _events(streamed) if e != "[DONE]"
+    ]
+    assert "".join(deltas) == unary["text"]

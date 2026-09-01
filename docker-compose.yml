@@ -1,4 +1,10 @@
 # Local development stack: one gateway, one worker.
+#
+# `docker compose up --build --scale worker=N` starts N workers. Compose gives
+# them one DNS name, so the gateway distributes across replicas by resolution
+# rather than by its own least-in-flight accounting; for that, list the workers
+# explicitly in TESSERA_WORKER_ENDPOINTS.
+#
 # Bring up with `docker compose up --build`, then:
 #   curl -X POST localhost:8080/v1/completions \
 #     -H 'Content-Type: application/json' \
@@ -14,8 +20,16 @@ services:
       TESSERA_DEVICE: cpu
       TESSERA_GRPC_PORT: "50051"
       TESSERA_LOG_LEVEL: INFO
+      # The reference engine is the correctness oracle, not a serving choice:
+      # it re-runs a dense forward pass per token. The stack serves with
+      # continuous batching so concurrent requests share forward passes.
+      TESSERA_BACKEND: ${TESSERA_BACKEND:-batched}
+      TESSERA_MAX_BATCH_SIZE: ${TESSERA_MAX_BATCH_SIZE:-8}
     ports:
-      - "50051:50051"
+      # Published on an ephemeral host port rather than a fixed one, so
+      # `docker compose up --scale worker=N` does not collide. The gateway
+      # reaches the worker over the compose network, not through this.
+      - "50051"
     volumes:
       # Persist HF downloads so a rebuild does not re-fetch the weights.
       - hf-cache:/home/tessera/.cache/huggingface

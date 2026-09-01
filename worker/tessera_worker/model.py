@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .config import WorkerConfig
+from .config import WorkerConfig, max_positions
 from .sampling import SamplingParams, make_generator, sample_token
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ class ReferenceEngine:
 
     @property
     def max_position_embeddings(self) -> int:
-        return int(getattr(self.model.config, "n_positions", 1024))
+        return max_positions(self.model.config)
 
     @torch.inference_mode()
     def forward_logits(self, token_ids: list[int]) -> torch.Tensor:

@@ -6,11 +6,13 @@ gateway -> gRPC -> worker; this module skips the gateway entirely.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import WorkerConfig
@@ -26,6 +28,7 @@ class CompletionRequest(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     seed: int | None = None
+    stream: bool = False
 
 
 class CompletionResponse(BaseModel):
@@ -58,21 +61,69 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
             "backend": handle.backend,
         }
 
+    def _sse(request: CompletionRequest, params: SamplingParams) -> StreamingResponse:
+        """Stream tokens as server-sent events, matching the gateway's shape.
+
+        Each event carries one token's delta, so a client appends rather than
+        diffing, and the stream is terminated by `[DONE]`.
+        """
+        engine = handle.engine
+
+        def events():
+            try:
+                for chunk in engine.iter_generate(
+                    prompt=request.prompt,
+                    max_tokens=request.max_tokens,
+                    params=params,
+                ):
+                    payload = {
+                        "object": "text_completion.chunk",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "text": chunk.text,
+                                "finish_reason": chunk.finish_reason,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+            except Exception as exc:  # noqa: BLE001 - relayed to the client
+                # Headers are already sent, so the only way to report a
+                # mid-stream failure is inside the stream itself.
+                logger.exception("stream failed")
+                yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
     @app.post("/v1/completions", response_model=CompletionResponse)
-    def completions(request: CompletionRequest) -> CompletionResponse:
+    def completions(request: CompletionRequest):
         if request.max_tokens > config.max_tokens_cap:
             raise HTTPException(
                 status_code=422,
                 detail=f"max_tokens exceeds cap {config.max_tokens_cap}",
             )
+        params = SamplingParams(
+            temperature=request.temperature,
+            top_p=request.top_p,
+            seed=request.seed,
+        )
+
+        if request.stream:
+            if not hasattr(handle.engine, "iter_generate"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"backend {handle.backend!r} cannot stream; use the "
+                        "paged, batched or speculative backend"
+                    ),
+                )
+            return _sse(request, params)
+
         result = handle.engine.generate(
             prompt=request.prompt,
             max_tokens=request.max_tokens,
-            params=SamplingParams(
-                temperature=request.temperature,
-                top_p=request.top_p,
-                seed=request.seed,
-            ),
+            params=params,
         )
         return CompletionResponse(
             text=result.text,
