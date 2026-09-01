@@ -7,10 +7,16 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/home/tessera/.cache/huggingface
 
+# HF_HOME is a volume mount point in docker-compose. Docker seeds a new named
+# volume from the image, ownership included, but only if the path exists in the
+# image; otherwise it creates the mount point root-owned and the unprivileged
+# user cannot write the model cache.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --uid 10001 tessera
+    && useradd --create-home --uid 10001 tessera \
+    && mkdir -p /home/tessera/.cache/huggingface \
+    && chown -R tessera:tessera /home/tessera
 
 WORKDIR /app
 
