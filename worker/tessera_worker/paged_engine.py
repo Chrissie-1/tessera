@@ -12,6 +12,12 @@ thing that assertion can be testing is the cache.
 
 Unary and streaming generation share one decode loop -- `iter_generate` -- so
 the two cannot drift apart. `generate` is that loop, accumulated.
+
+Decode steps read the cache through `attention_hook`, so the block table is
+walked inside attention and the per-step gather disappears. Prefill is left on
+the model's own attention deliberately -- it is one dense pass, not a per-token
+cost -- and if the hook cannot be installed the engine falls back to gathering,
+which is slower and identical.
 """
 
 from __future__ import annotations
@@ -24,6 +30,7 @@ from dataclasses import dataclass
 import torch
 from transformers.cache_utils import DynamicCache
 
+from .attention_hook import enable_paged_attention, paged_decode
 from .config import WorkerConfig, num_layers
 from .model import GenerationResult, ReferenceEngine
 from .paged import PagedKVCache
@@ -69,6 +76,10 @@ class PagedEngine(ReferenceEngine):
             dtype=config.dtype,
         )
         self._next_seq_id = 0
+        # Whether single-token decode reads the pool through the paged kernel.
+        # Recorded rather than re-checked per step, and consulted by the tests
+        # that assert the kernel is genuinely on the decode path.
+        self.paged_attention_enabled = enable_paged_attention(self.model)
 
     def _new_sequence_id(self) -> int:
         seq_id = self._next_seq_id
@@ -88,6 +99,46 @@ class PagedEngine(ReferenceEngine):
             (layer.keys[:, :, since:, :], layer.values[:, :, since:, :])
             for layer in cache.layers
         ]
+
+    def decode_step(self, seq_id: int, token_id: int) -> torch.Tensor:
+        """Advance `seq_id` by one token and return the next position's logits.
+
+        Two routes to the same answer. The paged route claims the position
+        first, then lets attention write into it and read the block table
+        directly, so no copy of the context is made. The gathered route is the
+        Phase 2 behaviour, kept for whenever the hook is not installed.
+        """
+        input_ids = torch.tensor(
+            [[token_id]], dtype=torch.long, device=self.config.device
+        )
+
+        if self.paged_attention_enabled:
+            position = self.cache.reserve(seq_id, 1)
+            with paged_decode(self.cache, seq_id, position):
+                # No `past_key_values`: the past lives in the pool, and the
+                # model would otherwise concatenate a second copy of it. That
+                # also means the position has to be stated, since there is no
+                # cache length for the model to infer it from. `position_ids`
+                # is the signal GPT-2 reads, and is what this is tested on; an
+                # architecture that positions itself from `cache_position`
+                # instead would need that passed too.
+                outputs = self.model(
+                    input_ids=input_ids,
+                    use_cache=False,
+                    position_ids=torch.tensor(
+                        [[position]], dtype=torch.long, device=self.config.device
+                    ),
+                )
+            return outputs.logits[0, -1, :]
+
+        cached_len = self.cache.length(seq_id)
+        outputs = self.model(
+            input_ids=input_ids,
+            past_key_values=self.cache.to_cache(seq_id),
+            use_cache=True,
+        )
+        self.cache.append(seq_id, self.new_kv(outputs.past_key_values, cached_len))
+        return outputs.logits[0, -1, :]
 
     @torch.inference_mode()
     def iter_generate(
@@ -144,20 +195,7 @@ class PagedEngine(ReferenceEngine):
                 if last:
                     return
 
-                # Decode: feed one token against the gathered block table.
-                past = self.cache.to_cache(seq_id)
-                cached_len = self.cache.length(seq_id)
-                outputs = self.model(
-                    input_ids=torch.tensor(
-                        [[next_token]], dtype=torch.long, device=self.config.device
-                    ),
-                    past_key_values=past,
-                    use_cache=True,
-                )
-                self.cache.append(
-                    seq_id, self.new_kv(outputs.past_key_values, cached_len)
-                )
-                logits = outputs.logits[0, -1, :]
+                logits = self.decode_step(seq_id, next_token)
 
             # Reached only by an EOS stop or a zero-token budget, both of
             # which still owe the caller a terminal chunk.

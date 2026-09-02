@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`attention_hook.py`** — paged attention is now on the decode path.
+  `PagedEngine`'s single-token steps register a function in transformers'
+  `ALL_ATTENTION_FUNCTIONS` and select it on the model, so each layer writes
+  the new token's keys and values into the block pool and attends over the
+  block table through the `paged_attention` dispatcher. `PagedKVCache.gather`
+  is no longer called during decode.
+- **`PagedKVCache.reserve` / `write` / `layer_keys` / `layer_values` /
+  `block_table_tensor`** — the cache API attention writes through, for a
+  forward pass that fills the pool one layer at a time rather than all at once.
+- **`PagedEngine.decode_step`** — one decode step, on either the paged or the
+  gathered route, so the two cannot drift.
+
+### Notes
+
+- Prefill, batched decode, and grouped-query attention deliberately stay on the
+  model's own attention; an uninstallable hook falls back to gathering.
+- The integration is verified on CPU, where the dispatcher selects the torch
+  implementation. It has never been run on CUDA, so the Triton kernel's
+  behaviour *on the decode path* is untested.
 
 ## [0.1.0] - 2026-09-01
 

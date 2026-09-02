@@ -12,11 +12,14 @@ time as it decodes. Memory is committed to a sequence only once it is actually
 used, and freeing a sequence returns whole blocks to the pool with no
 compaction and no fragmentation.
 
-Attention itself is still the model's own implementation: each step gathers the
-sequence's blocks into the contiguous tensors transformers expects. Phase 4's
-Triton kernel is what removes that gather by attending over the block table
-directly. The gather is the cost of staying correct in the meantime, and the
-equivalence tests exist to keep it honest.
+There are two ways to read the cache back. `gather` rebuilds the contiguous
+tensors transformers expects, which is what any code path still using the
+model's own attention needs. Single-token decode instead goes through
+`attention_hook`, which claims a slot with `reserve`, has each layer `write`
+its own keys and values as it runs, and attends over the block table directly
+-- so nothing the size of the context is ever copied. `gather` remains the
+fallback for the paths that kernel does not cover, and the equivalence tests
+keep both honest.
 """
 
 from __future__ import annotations
@@ -145,9 +148,12 @@ class PagedKVCache:
     # -- storage ------------------------------------------------------------
 
     def _ensure_storage(self, keys: torch.Tensor) -> None:
+        _, num_heads, _, head_dim = keys.shape
+        self._allocate_storage(num_heads, head_dim)
+
+    def _allocate_storage(self, num_heads: int, head_dim: int) -> None:
         if self._keys is not None:
             return
-        _, num_heads, _, head_dim = keys.shape
         shape = (self.allocator.num_blocks, num_heads, self.block_size, head_dim)
         self._keys = [
             torch.zeros(shape, device=self.device, dtype=self.dtype)
@@ -205,6 +211,74 @@ class PagedKVCache:
             written += span
 
         self._lengths[seq_id] = start + new_tokens
+
+    def reserve(self, seq_id: int, new_tokens: int) -> int:
+        """Commit blocks for `new_tokens` and claim their logical positions.
+
+        `append` suits a forward pass that hands its whole cache back at the
+        end: every layer's tensors exist at once. Paged attention writes as it
+        goes -- layer n's keys exist only while layer n is running -- so the
+        positions have to be claimed before the pass starts and filled in by
+        `write` as each layer reaches them.
+
+        Returns the first logical position claimed.
+        """
+        if new_tokens <= 0:
+            raise ValueError("new_tokens must be positive")
+        start = self._lengths[seq_id]
+        table = self._tables[seq_id]
+        while len(table) * self.block_size < start + new_tokens:
+            table.append(self.allocator.allocate())
+        self._lengths[seq_id] = start + new_tokens
+        return start
+
+    def write(
+        self,
+        seq_id: int,
+        layer: int,
+        position: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Store one layer's keys and values for a single reserved position.
+
+        Args:
+            seq_id: sequence being extended.
+            layer: decoder layer the tensors belong to.
+            position: logical position, previously handed out by `reserve`.
+            keys: (num_heads, head_dim) for that position.
+            values: same shape as `keys`.
+        """
+        if not 0 <= position < self._lengths[seq_id]:
+            raise ValueError(
+                f"position {position} is not reserved for sequence {seq_id}"
+            )
+        self._allocate_storage(keys.shape[0], keys.shape[1])
+
+        block_id = self._tables[seq_id][position // self.block_size]
+        offset = position % self.block_size
+        self._keys[layer][block_id, :, offset, :] = keys
+        self._values[layer][block_id, :, offset, :] = values
+
+    def layer_keys(self, layer: int) -> torch.Tensor:
+        """The whole key pool for `layer`, as (blocks, heads, block_size, dim).
+
+        Handed out unsliced on purpose: paged attention addresses it through a
+        block table, so anything narrower would be the gather all over again.
+        """
+        if self._keys is None:
+            raise RuntimeError("cache storage is not allocated yet")
+        return self._keys[layer]
+
+    def layer_values(self, layer: int) -> torch.Tensor:
+        """The whole value pool for `layer`. See `layer_keys`."""
+        if self._values is None:
+            raise RuntimeError("cache storage is not allocated yet")
+        return self._values[layer]
+
+    def block_table_tensor(self, seq_id: int) -> torch.Tensor:
+        """`seq_id`'s block table as a tensor, ready to index the pool with."""
+        return torch.tensor(self._tables[seq_id], dtype=torch.long, device=self.device)
 
     def truncate(self, seq_id: int, new_length: int) -> None:
         """Drop everything past `new_length`, releasing blocks it freed up.

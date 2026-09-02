@@ -99,11 +99,28 @@ readable PyTorch one that gathers, and a Triton kernel that walks the block
 table inside the kernel with an online softmax, so a sequence's keys and values
 are never materialised contiguously.
 
-**The kernel is not yet wired into the serving path.** The decode engines still
-call `PagedKVCache.gather`. The kernel is covered by its own equivalence tests
-against the PyTorch version and measurable via `bench/attention.py`, but
-replacing the model's attention with it is not done. See
-[Limitations](#limitations).
+`attention_hook.py` wires it into `PagedEngine`'s decode path. transformers 5.x
+resolves attention through `ALL_ATTENTION_FUNCTIONS`, so the hook registers a
+function there and selects it on the model: each layer writes the new token's
+keys and values straight into the block pool and attends over the block table,
+and `PagedKVCache.gather` is never called during decode. The dispatcher is what
+is wired in, so CUDA gets the Triton kernel and everything else gets the torch
+implementation.
+
+Three cases deliberately stay on the model's own attention: **prefill** (many
+query positions, one dense pass either way, not the per-token cost the kernel
+removes), **batched decode** under `ContinuousBatcher` (one padded cache for the
+whole batch), and **grouped-query attention**. If the hook cannot be installed —
+a transformers without the attention interface, or a model not on `sdpa` — the
+engine falls back to gathering, which is slower and identical.
+
+**What is verified, and where.** The integration is tested on CPU against the
+reference engine, and the tests fail if the engine silently reverts to
+gathering. What is *not* verified here: the Triton kernel itself, which needs a
+GPU. The GPU tests that hold it to the torch implementation skip without CUDA,
+and this integration has never been executed on a CUDA device — on such a
+machine the same hook would dispatch to `paged_attention_triton` instead, and
+that combination is untested. See [Limitations](#limitations).
 
 ## Quick start
 
@@ -304,6 +321,7 @@ tessera/
 │   ├── serving.py       # BatchedEngine — scheduler as a servable engine
 │   ├── speculative.py   # SpeculativeEngine, ModelDrafter
 │   ├── attention.py     # paged attention: torch reference + Triton kernel
+│   ├── attention_hook.py # the kernel, registered as the model's attention
 │   ├── sampling.py      # temperature, top-p, residual distribution
 │   ├── engine.py        # backend registry and lifecycle
 │   ├── server.py        # gRPC servicer
@@ -332,7 +350,12 @@ small for the results to say anything about real serving.
 
 ## Limitations
 
-- The Triton paged-attention kernel is validated but **not wired into decoding**.
+- Paged attention is wired into single-sequence decode only. Prefill, batched
+  decode, and grouped-query attention stay on the model's own attention.
+- The Triton kernel has never been run as part of that integration: this repo's
+  tests run on CPU, where the dispatcher selects the torch implementation. On a
+  CUDA machine the hook dispatches to `paged_attention_triton`, which is tested
+  only against the torch version in isolation, never on the decode path.
 - `docker compose --scale worker=N` starts N workers, but Compose gives them a
   single DNS name, so the gateway spreads load by name resolution rather than by
   its own least-in-flight accounting. For true per-worker routing, list the
