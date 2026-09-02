@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`metrics.py`** — Prometheus metrics for the telemetry the engines were
+  already computing and then discarding. Counters for requests
+  (`tessera_requests_total{outcome}`, where `outcome` is `success`, `error` or
+  `rejected`), prompt and generated tokens, and a latency histogram
+  (`tessera_request_latency_seconds`) recorded on both the gRPC and the HTTP
+  paths, streaming included. Gauges for instantaneous state, read off the live
+  objects at scrape time rather than mirrored from the decode loop: the
+  servicer's in-flight count, the paged allocator's block totals and
+  `PagedKVCache.utilisation`, the `ContinuousBatcher` queue (waiting, running,
+  pending, slot limit), and `SpeculativeEngine`'s proposed/accepted counters
+  with its acceptance rate. Metrics with no source in the running backend are
+  absent rather than zero, and nothing is labelled by prompt, request id or
+  generated text.
+- **`GET /metrics` on the FastAPI wrapper**, and a standalone Prometheus HTTP
+  exporter for the gRPC worker, since production runs gRPC and had no HTTP
+  surface at all. The exporter is opt-in through the new
+  `TESSERA_METRICS_PORT` (default `0`, off), because the gRPC server is also
+  started embedded by tests and by the benchmark harness; a port it cannot
+  bind is logged and skipped rather than raised.
+- **`worker/tests/test_metrics.py`** — the exported numbers checked against
+  the state they describe: the token counters against what the servicer
+  returned, the cache gauges against the allocator's own block count
+  mid-decode and after the sequence is freed, the queue gauges against the
+  scheduler's own deque, the speculative counters against the engine's
+  attributes. Also that a failing counter does not fail a request and a
+  failing collector does not fail a scrape.
+- **`prometheus-client`** is a declared dependency again, this time because
+  `metrics.py` imports it.
 - **`attention_hook.py`** — paged attention is now on the decode path.
   `PagedEngine`'s single-token steps register a function in transformers'
   `ALL_ATTENTION_FUNCTIONS` and select it on the model, so each layer writes

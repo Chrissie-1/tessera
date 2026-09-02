@@ -40,6 +40,11 @@ dependencies = [
     # uvicorn is a console script (see `make run-api`), not an import.
     "uvicorn>=0.29",
     "pydantic>=2.6",
+    # Imported by metrics.py: the exposition format and the standalone HTTP
+    # exporter the gRPC worker starts. Declared again only now that it is
+    # actually used -- it was removed once for being a dependency nobody
+    # imported, and scripts/validate-release.sh checks for exactly that.
+    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]

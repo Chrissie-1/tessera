@@ -6,11 +6,13 @@ import logging
 import os
 import signal
 import threading
+import time
 import uuid
 from concurrent import futures
 
 import grpc
 
+from . import metrics
 from .config import WorkerConfig
 from .engine import EngineHandle
 from .generated import inference_pb2, inference_pb2_grpc
@@ -43,16 +45,21 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
         self._handle = handle
         self._in_flight = 0
         self._lock = threading.Lock()
+        metrics.track_servicer(self)
 
     def _validate(self, request, context) -> None:
         """Reject a malformed request. Shared by unary and streaming."""
         if request.max_tokens <= 0:
+            # Counted with no latency: a rejected request never reached the
+            # model, so it belongs in the totals but not in the histogram.
+            metrics.record_request(outcome="rejected")
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT, "max_tokens must be positive"
             )
 
         cap = self._handle.config.max_tokens_cap
         if request.max_tokens > cap:
+            metrics.record_request(outcome="rejected")
             context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
                 f"max_tokens {request.max_tokens} exceeds cap {cap}",
@@ -78,6 +85,7 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
         params = _params_from(request)
 
         self._enter()
+        start = time.perf_counter()
         try:
             result = self._handle.engine.generate(
                 prompt=request.prompt,
@@ -85,10 +93,19 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
                 params=params,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+            metrics.record_request(
+                latency_seconds=time.perf_counter() - start, outcome="error"
+            )
             logger.exception("generation failed request_id=%s", request_id)
             context.abort(grpc.StatusCode.INTERNAL, f"generation failed: {exc}")
         finally:
             self._exit()
+
+        metrics.record_request(
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            latency_seconds=result.latency_ms / 1000.0,
+        )
 
         logger.info(
             "request_id=%s prompt_tokens=%d completion_tokens=%d latency_ms=%.1f",
@@ -127,8 +144,10 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
 
         params = _params_from(request)
         completion_tokens = 0
+        prompt_tokens = 0
 
         self._enter()
+        start = time.perf_counter()
         try:
             for chunk in engine.iter_generate(
                 prompt=request.prompt,
@@ -137,6 +156,7 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
             ):
                 if chunk.token_id is not None:
                     completion_tokens += 1
+                prompt_tokens = chunk.prompt_tokens
                 yield inference_pb2.GenerateResponse(
                     text=chunk.text,
                     finished=chunk.finished,
@@ -146,8 +166,23 @@ class InferenceServicer(inference_pb2_grpc.InferenceServicer):
                     finish_reason=chunk.finish_reason or "",
                 )
         except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+            metrics.record_request(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_seconds=time.perf_counter() - start,
+                outcome="error",
+            )
             logger.exception("stream failed request_id=%s", request_id)
             context.abort(grpc.StatusCode.INTERNAL, f"generation failed: {exc}")
+        else:
+            # `else`, not `finally`: a client that walks away mid-stream closes
+            # this generator with GeneratorExit, and that is neither a served
+            # request nor an engine error, so it is counted as neither.
+            metrics.record_request(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_seconds=time.perf_counter() - start,
+            )
         finally:
             self._exit()
 
@@ -170,6 +205,10 @@ def serve(config: WorkerConfig | None = None) -> None:
 
     handle = EngineHandle(config)
     handle.load()
+
+    # Production runs gRPC, so the scrape target has to exist here rather than
+    # only on the FastAPI dev wrapper.
+    metrics.start_metrics_server(config.metrics_port)
 
     server = grpc.server(
         futures.ThreadPoolExecutor(max_workers=int(os.getenv("TESSERA_THREADS", "8"))),

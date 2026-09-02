@@ -94,6 +94,17 @@ def test_sizing_is_read_from_the_environment(monkeypatch):
     assert (config.block_size, config.lookahead) == (8, 2)
 
 
+def test_metrics_port_is_off_unless_the_environment_sets_it(monkeypatch):
+    """Nothing binds a metrics port by accident; it is opt-in."""
+    monkeypatch.delenv("TESSERA_METRICS_PORT", raising=False)
+
+    assert WorkerConfig.from_env().metrics_port == 0
+
+    monkeypatch.setenv("TESSERA_METRICS_PORT", "9187")
+
+    assert WorkerConfig.from_env().metrics_port == 9187
+
+
 def test_engines_take_their_sizing_from_the_config(config):
     """A configured value must reach the engine without an explicit argument."""
     from tessera_worker.paged_engine import PagedEngine

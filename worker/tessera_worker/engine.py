@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import os
 
+from . import metrics
 from .config import WorkerConfig
 from .model import ReferenceEngine
 from .paged_engine import PagedEngine
@@ -51,6 +52,10 @@ class EngineHandle:
             return
         logger.info("initialising backend=%s", self.backend)
         self._engine = BACKENDS[self.backend](self.config)
+        # Bound here rather than at each call site so that every way of
+        # starting a worker -- gRPC, the FastAPI wrapper, an embedded handle
+        # -- exports engine state without having to remember to.
+        metrics.bind_engine(self)
 
     @property
     def ready(self) -> bool:

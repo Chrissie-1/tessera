@@ -248,9 +248,40 @@ gateway uses for routing).
 ### Worker HTTP wrapper
 
 `tessera_worker.api` is a small FastAPI app for poking at the worker without
-the gateway (`make run-api`, port 8000). It exposes `GET /health` and
-`POST /v1/completions`, including `"stream": true`, which emits the same SSE
-shape the gateway does. It is a debugging surface, not the production path.
+the gateway (`make run-api`, port 8000). It exposes `GET /health`,
+`GET /metrics` and `POST /v1/completions`, including `"stream": true`, which
+emits the same SSE shape the gateway does. It is a debugging surface, not the
+production path.
+
+### Worker metrics
+
+The worker exports Prometheus metrics in the standard text exposition format.
+Production runs gRPC rather than the FastAPI wrapper, so the exporter is a
+standalone HTTP listener: set `TESSERA_METRICS_PORT` and scrape
+`http://<worker>:<port>/metrics`. It is off by default — the gRPC server is
+also started embedded, by tests and by the benchmark harness, and neither
+should quietly bind a port. The FastAPI wrapper serves the same registry at
+`GET /metrics` regardless.
+
+| Metric | Type | Source |
+|---|---|---|
+| `tessera_requests_total{outcome}` | counter | requests that finished; `outcome` is `success`, `error` or `rejected` |
+| `tessera_prompt_tokens_total` | counter | prompt tokens accepted |
+| `tessera_generated_tokens_total` | counter | tokens emitted, streaming included |
+| `tessera_request_latency_seconds` | histogram | end-to-end latency per request |
+| `tessera_requests_in_flight` | gauge | the servicer's own in-flight count |
+| `tessera_kv_cache_blocks_total` / `_used` / `_free` | gauge | the paged allocator's free list |
+| `tessera_kv_cache_utilisation` | gauge | `PagedKVCache.utilisation`, 0 to 1 |
+| `tessera_scheduler_waiting_requests` / `_running_sequences` / `_pending_requests` / `_max_batch_size` | gauge | `ContinuousBatcher` queue state |
+| `tessera_speculative_proposed_tokens_total` / `_accepted_tokens_total` / `tessera_speculative_acceptance_rate` | counter, gauge | `SpeculativeEngine`'s own counters |
+| `tessera_engine_ready`, `tessera_worker_info{backend,model,device}` | gauge, info | `EngineHandle` |
+
+Gauges are read off the live engine when a scrape arrives, not mirrored from
+the decode loop, so a scrape cannot report occupancy that was true ten minutes
+ago. Metrics a backend has no source for are absent rather than zero: the
+`reference` backend publishes no cache gauges, and only `speculative` publishes
+acceptance. Labels are deliberately few — nothing is labelled by prompt,
+request id or generated text.
 
 ## Configuration
 
@@ -277,6 +308,7 @@ shape the gateway does. It is a debugging surface, not the production path.
 | `TESSERA_MAX_TOKENS_CAP` | `512` | Largest accepted `max_tokens` |
 | `TESSERA_THREADS` | `8` | gRPC server thread-pool size |
 | `TESSERA_LOG_LEVEL` | `INFO` | Python logging level |
+| `TESSERA_METRICS_PORT` | `0` | Prometheus exporter port; `0` leaves it off |
 | `TESSERA_MAX_BATCH_SIZE` | `8` | Sequences the `batched` scheduler runs concurrently |
 | `TESSERA_NUM_BLOCKS` | `512` | Blocks in the paged KV pool |
 | `TESSERA_BLOCK_SIZE` | `16` | Tokens per block |
@@ -405,8 +437,10 @@ small for the results to say anything about real serving.
   single DNS name, so the gateway spreads load by name resolution rather than by
   its own least-in-flight accounting. For true per-worker routing, list the
   endpoints explicitly in `TESSERA_WORKER_ENDPOINTS`.
-- No metrics endpoint, no authentication, no TLS, no request timeouts beyond the
-  gRPC client's 300s ceiling.
+- No authentication, no TLS, and no request timeouts beyond the gRPC client's
+  300s ceiling.
+- The metrics cover the worker only. The Rust gateway exports nothing, so
+  queueing and shedding decisions made there are still invisible.
 - Single process per worker; no multi-GPU, quantisation, prefix caching, or
   LoRA.
 - The drafter in `SpeculativeEngine` defaults to the *target model itself*,

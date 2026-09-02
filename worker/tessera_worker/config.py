@@ -75,6 +75,10 @@ class WorkerConfig:
     grpc_port: int
     http_port: int
     max_tokens_cap: int
+    # 0 disables the Prometheus HTTP listener. Off by default because the
+    # gRPC server is also run embedded (tests, bench harness), and those must
+    # not silently bind a port.
+    metrics_port: int = 0
     # Engine sizing. Defaults mirror the constructor defaults of the engines
     # themselves, so setting nothing behaves exactly as it did before these
     # became configurable.
@@ -93,6 +97,7 @@ class WorkerConfig:
             grpc_port=int(os.getenv("TESSERA_GRPC_PORT", "50051")),
             http_port=int(os.getenv("TESSERA_HTTP_PORT", "8000")),
             max_tokens_cap=int(os.getenv("TESSERA_MAX_TOKENS_CAP", "512")),
+            metrics_port=int(os.getenv("TESSERA_METRICS_PORT", "0")),
             max_batch_size=int(
                 os.getenv("TESSERA_MAX_BATCH_SIZE", str(DEFAULT_MAX_BATCH_SIZE))
             ),

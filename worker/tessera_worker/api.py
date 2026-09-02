@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from . import metrics
 from .config import WorkerConfig
 from .engine import EngineHandle
 from .sampling import SamplingParams
@@ -52,6 +54,16 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
 
     app = FastAPI(title="Tessera Worker", version="0.1.0", lifespan=lifespan)
 
+    @app.get("/metrics")
+    def prometheus_metrics() -> Response:
+        """Scrape target for the dev wrapper.
+
+        The gRPC worker exports the same registry over its own port (see
+        `TESSERA_METRICS_PORT`); this endpoint exists so the FastAPI surface
+        is not a blind spot when someone is debugging through it.
+        """
+        return Response(content=metrics.render(), media_type=metrics.CONTENT_TYPE)
+
     @app.get("/health")
     def health() -> dict:
         return {
@@ -70,12 +82,18 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
         engine = handle.engine
 
         def events():
+            start = time.perf_counter()
+            prompt_tokens = 0
+            completion_tokens = 0
             try:
                 for chunk in engine.iter_generate(
                     prompt=request.prompt,
                     max_tokens=request.max_tokens,
                     params=params,
                 ):
+                    prompt_tokens = chunk.prompt_tokens
+                    if chunk.token_id is not None:
+                        completion_tokens += 1
                     payload = {
                         "object": "text_completion.chunk",
                         "choices": [
@@ -90,8 +108,23 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
             except Exception as exc:  # noqa: BLE001 - relayed to the client
                 # Headers are already sent, so the only way to report a
                 # mid-stream failure is inside the stream itself.
+                metrics.record_request(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    latency_seconds=time.perf_counter() - start,
+                    outcome="error",
+                )
                 logger.exception("stream failed")
                 yield f"data: {json.dumps({'error': {'message': str(exc)}})}\n\n"
+            else:
+                # `else`, not `finally`: a client that disconnects mid-stream
+                # closes this generator with GeneratorExit, which is neither a
+                # served request nor an engine error, so it counts as neither.
+                metrics.record_request(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    latency_seconds=time.perf_counter() - start,
+                )
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(events(), media_type="text/event-stream")
@@ -99,6 +132,7 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
     @app.post("/v1/completions", response_model=CompletionResponse)
     def completions(request: CompletionRequest):
         if request.max_tokens > config.max_tokens_cap:
+            metrics.record_request(outcome="rejected")
             raise HTTPException(
                 status_code=422,
                 detail=f"max_tokens exceeds cap {config.max_tokens_cap}",
@@ -120,10 +154,23 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
                 )
             return _sse(request, params)
 
-        result = handle.engine.generate(
-            prompt=request.prompt,
-            max_tokens=request.max_tokens,
-            params=params,
+        start = time.perf_counter()
+        try:
+            result = handle.engine.generate(
+                prompt=request.prompt,
+                max_tokens=request.max_tokens,
+                params=params,
+            )
+        except Exception:
+            metrics.record_request(
+                latency_seconds=time.perf_counter() - start, outcome="error"
+            )
+            raise
+
+        metrics.record_request(
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            latency_seconds=result.latency_ms / 1000.0,
         )
         return CompletionResponse(
             text=result.text,
