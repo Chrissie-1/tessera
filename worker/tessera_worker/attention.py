@@ -12,6 +12,11 @@ are never materialised contiguously at all. Scores are accumulated with an
 online softmax, so one pass over the blocks suffices and nothing the size of
 the context is ever held in registers or scratch.
 
+Both implementations handle grouped-query attention, where the pool holds
+fewer KV heads than the query carries. Each group of query heads reads its
+shared KV head in place rather than through an expanded copy of the keys --
+expanding them would reintroduce, per step, exactly the copy paging removes.
+
 Two implementations live here on purpose. `paged_attention_torch` is the
 readable definition of what paged attention computes, and is what the tests
 check the kernel against; it gathers, because being obviously correct is its
@@ -36,6 +41,21 @@ except ImportError:  # pragma: no cover
     HAS_TRITON = False
 
 
+def kv_group_size(num_query_heads: int, num_kv_heads: int) -> int:
+    """Query heads per KV head, rejecting layouts that do not divide evenly.
+
+    Multi-head attention is the degenerate case where this is one. Anything
+    that is not a whole multiple is not grouped-query attention at all, and
+    guessing a mapping for it would silently attend to the wrong keys.
+    """
+    if num_kv_heads <= 0 or num_query_heads % num_kv_heads:
+        raise ValueError(
+            f"{num_query_heads} query heads do not group evenly "
+            f"onto {num_kv_heads} key/value heads"
+        )
+    return num_query_heads // num_kv_heads
+
+
 def paged_attention_torch(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -47,8 +67,8 @@ def paged_attention_torch(
     """Attention over a block table, written for clarity rather than speed.
 
     Args:
-        query: (num_heads, head_dim) query for the position being decoded.
-        key_cache: (num_blocks, num_heads, block_size, head_dim) pool.
+        query: (num_query_heads, head_dim) query for the position being decoded.
+        key_cache: (num_blocks, num_kv_heads, block_size, head_dim) pool.
         value_cache: same shape as `key_cache`.
         block_table: (num_used_blocks,) physical block ids, in logical order.
         seq_len: how many cached positions are real; the tail of the last
@@ -56,25 +76,38 @@ def paged_attention_torch(
         scale: softmax scale, defaulting to 1/sqrt(head_dim).
 
     Returns:
-        (num_heads, head_dim) attention output.
+        (num_query_heads, head_dim) attention output.
+
+    `num_kv_heads` may be smaller than `num_query_heads`: under grouped-query
+    attention a group of consecutive query heads shares one KV head. The group
+    is folded into the einsum rather than materialised with `repeat_kv`,
+    because expanding the keys is the copy paging exists to avoid.
     """
     if seq_len <= 0:
         raise ValueError("seq_len must be positive")
 
-    num_heads, head_dim = query.shape
+    num_query_heads, head_dim = query.shape
+    num_kv_heads = key_cache.shape[1]
+    group = kv_group_size(num_query_heads, num_kv_heads)
     scale = scale if scale is not None else 1.0 / math.sqrt(head_dim)
 
-    # (num_used_blocks, num_heads, block_size, head_dim) -> (num_heads, T, dim)
-    keys = key_cache[block_table].permute(1, 0, 2, 3).reshape(num_heads, -1, head_dim)
+    # (num_used_blocks, num_kv_heads, block_size, dim) -> (num_kv_heads, T, dim)
+    keys = (
+        key_cache[block_table].permute(1, 0, 2, 3).reshape(num_kv_heads, -1, head_dim)
+    )
     values = (
-        value_cache[block_table].permute(1, 0, 2, 3).reshape(num_heads, -1, head_dim)
+        value_cache[block_table].permute(1, 0, 2, 3).reshape(num_kv_heads, -1, head_dim)
     )
     keys = keys[:, :seq_len, :]
     values = values[:, :seq_len, :]
 
-    scores = torch.einsum("hd,htd->ht", query.float(), keys.float()) * scale
+    # Query head q reads KV head q // group, which is the same mapping
+    # transformers' `repeat_kv` produces by expanding each KV head in place.
+    grouped = query.float().reshape(num_kv_heads, group, head_dim)
+    scores = torch.einsum("hgd,htd->hgt", grouped, keys.float()) * scale
     weights = torch.softmax(scores, dim=-1)
-    return torch.einsum("ht,htd->hd", weights, values.float()).to(query.dtype)
+    output = torch.einsum("hgt,htd->hgd", weights, values.float())
+    return output.reshape(num_query_heads, head_dim).to(query.dtype)
 
 
 if HAS_TRITON:  # pragma: no cover - requires a GPU to execute
@@ -100,14 +133,21 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU to execute
         # constants, so the lint rule does not apply here.
         HEAD_DIM: tl.constexpr,  # noqa: N803
         BLOCK_SIZE: tl.constexpr,  # noqa: N803
+        GROUP: tl.constexpr,  # noqa: N803
     ):
-        """One program per attention head, streaming the block table.
+        """One program per query head, streaming the block table.
 
         The running maximum and denominator are carried across blocks so the
         softmax never needs a second pass, which is what lets the kernel touch
         each block exactly once regardless of how long the context is.
+
+        Under grouped-query attention `GROUP` query heads share one KV head,
+        so the program's KV head is its own index divided down. Each program
+        still reads the pool directly; nothing is expanded to make the head
+        counts match.
         """
         head = tl.program_id(0)
+        kv_head = head // GROUP
 
         offs_d = tl.arange(0, HEAD_DIM)
         offs_t = tl.arange(0, BLOCK_SIZE)
@@ -126,7 +166,7 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU to execute
 
             key_offsets = (
                 physical * stride_kb
-                + head * stride_kh
+                + kv_head * stride_kh
                 + offs_t[:, None] * stride_kt
                 + offs_d[None, :]
             )
@@ -145,7 +185,7 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU to execute
 
             value_offsets = (
                 physical * stride_vb
-                + head * stride_vh
+                + kv_head * stride_vh
                 + offs_t[:, None] * stride_vt
                 + offs_d[None, :]
             )
@@ -176,8 +216,9 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU to execute
         if not query.is_cuda:
             raise ValueError("paged_attention_triton requires CUDA tensors")
 
-        num_heads, head_dim = query.shape
+        num_query_heads, head_dim = query.shape
         block_size = key_cache.shape[2]
+        group = kv_group_size(num_query_heads, key_cache.shape[1])
         scale = scale if scale is not None else 1.0 / math.sqrt(head_dim)
 
         query = query.contiguous()
@@ -188,7 +229,7 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU to execute
         ).contiguous()
         output = torch.empty_like(query, dtype=torch.float32)
 
-        _paged_attention_kernel[(num_heads,)](
+        _paged_attention_kernel[(num_query_heads,)](
             query,
             key_cache,
             value_cache,
@@ -206,6 +247,7 @@ if HAS_TRITON:  # pragma: no cover - requires a GPU to execute
             output.stride(0),
             HEAD_DIM=head_dim,
             BLOCK_SIZE=block_size,
+            GROUP=group,
         )
         return output.to(query.dtype)
 

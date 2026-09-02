@@ -20,6 +20,7 @@ import torch
 
 from tessera_worker.attention import (
     HAS_TRITON,
+    kv_group_size,
     paged_attention,
     paged_attention_torch,
 )
@@ -163,6 +164,121 @@ def test_dispatch_uses_torch_on_cpu():
     assert torch.allclose(actual, dense_attention(query, keys, values), atol=1e-5)
 
 
+# -- grouped-query attention ------------------------------------------------
+
+
+def repeat_kv(states: torch.Tensor, group: int) -> torch.Tensor:
+    """Expand KV heads onto query heads the way transformers does.
+
+    `repeat_kv` repeats each head `group` times *in place*, so query head q
+    reads KV head q // group. Reproducing that here rather than asserting the
+    mapping abstractly is what would catch an interleaved reading of it.
+    """
+    return states.repeat_interleave(group, dim=0)
+
+
+def make_grouped_case(
+    num_query_heads=8, num_kv_heads=2, seq_len=10, head_dim=8, block_size=4
+):
+    """A pool holding fewer KV heads than the query carries.
+
+    The block table is shuffled as in `make_case`, so the grouping is checked
+    on top of the indirection rather than in place of it.
+    """
+    torch.manual_seed(num_kv_heads * 1000 + seq_len)
+    query = torch.randn(num_query_heads, head_dim)
+    keys = torch.randn(num_kv_heads, seq_len, head_dim)
+    values = torch.randn(num_kv_heads, seq_len, head_dim)
+
+    used = (seq_len + block_size - 1) // block_size
+    num_blocks = used + 4
+    table = list(range(num_blocks))[::-1][:used]
+    key_cache, value_cache = scatter_into_blocks(
+        keys, values, block_size, table, num_blocks
+    )
+    return query, keys, values, key_cache, value_cache, torch.tensor(table)
+
+
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads", "seq_len"),
+    [(8, 2, 10), (4, 1, 7), (6, 3, 16), (4, 4, 5), (8, 2, 1)],
+    ids=["group_4", "multi_query", "group_2", "no_grouping", "single_token"],
+)
+def test_grouped_query_matches_dense_over_expanded_heads(
+    num_query_heads, num_kv_heads, seq_len
+):
+    """Paging a group must equal expanding it and attending densely.
+
+    This is the claim that lets the hook stop deferring grouped-query models:
+    reading one KV head from several query heads has to give exactly what
+    `repeat_kv` plus ordinary attention would have given.
+    """
+    query, keys, values, key_cache, value_cache, table = make_grouped_case(
+        num_query_heads=num_query_heads, num_kv_heads=num_kv_heads, seq_len=seq_len
+    )
+    group = num_query_heads // num_kv_heads
+
+    actual = paged_attention_torch(query, key_cache, value_cache, table, seq_len)
+    expected = dense_attention(query, repeat_kv(keys, group), repeat_kv(values, group))
+
+    assert actual.shape == (num_query_heads, query.shape[-1])
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_grouped_query_ignores_the_unwritten_tail():
+    """The tail masking has to survive the regrouped einsum."""
+    seq_len, block_size = 6, 4
+    query, keys, values, key_cache, value_cache, table = make_grouped_case(
+        num_query_heads=8, num_kv_heads=2, seq_len=seq_len, block_size=block_size
+    )
+    key_cache[table[-1], :, seq_len % block_size :, :] = 1e4
+    value_cache[table[-1], :, seq_len % block_size :, :] = 1e4
+
+    actual = paged_attention_torch(query, key_cache, value_cache, table, seq_len)
+    expected = dense_attention(query, repeat_kv(keys, 4), repeat_kv(values, 4))
+
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_each_group_reads_only_its_own_kv_head():
+    """A wrong head mapping would still produce plausible numbers.
+
+    Giving one KV head a distinctive value and zeroing the rest makes the
+    mapping visible in the output: only the query heads in that group may see
+    it. Comparing against `repeat_kv` alone would not localise the error.
+    """
+    num_query_heads, num_kv_heads, head_dim, seq_len = 6, 3, 4, 4
+    query = torch.ones(num_query_heads, head_dim)
+    key_cache = torch.zeros(1, num_kv_heads, seq_len, head_dim)
+    value_cache = torch.zeros(1, num_kv_heads, seq_len, head_dim)
+    value_cache[0, 1] = 5.0
+
+    actual = paged_attention_torch(
+        query, key_cache, value_cache, torch.tensor([0]), seq_len
+    )
+
+    # Query heads 2 and 3 form the group over KV head 1.
+    assert torch.equal(actual[2:4], torch.full((2, head_dim), 5.0))
+    assert torch.equal(actual[[0, 1, 4, 5]], torch.zeros(4, head_dim))
+
+
+def test_rejects_head_counts_that_do_not_group_evenly():
+    """A ragged mapping is not grouped-query attention; guessing one is worse."""
+    with pytest.raises(ValueError, match="do not group evenly"):
+        kv_group_size(6, 4)
+
+    query = torch.randn(6, 4)
+    key_cache = torch.randn(2, 4, 4, 4)
+    with pytest.raises(ValueError, match="do not group evenly"):
+        paged_attention_torch(
+            query, key_cache, key_cache, torch.tensor([0, 1]), seq_len=5
+        )
+
+
+def test_group_size_of_one_is_plain_multi_head_attention():
+    assert kv_group_size(8, 8) == 1
+
+
 # -- Triton kernel ----------------------------------------------------------
 
 
@@ -239,5 +355,34 @@ def test_dispatch_uses_the_kernel_on_cuda():
     actual = paged_attention(
         query.cuda(), key_cache.cuda(), value_cache.cuda(), table.cuda(), seq_len
     )
+
+    assert torch.allclose(actual.cpu(), expected, atol=1e-4)
+
+
+@requires_triton
+@requires_cuda
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads"),
+    [(8, 2), (4, 1)],
+    ids=["group_4", "multi_query"],
+)
+def test_kernel_matches_torch_under_grouped_query(num_query_heads, num_kv_heads):
+    """The kernel divides its program id down to a KV head; torch reshapes.
+
+    Two different expressions of the same mapping, so they are worth checking
+    against each other rather than each against the dense form alone.
+    """
+    from tessera_worker.attention import paged_attention_triton
+
+    seq_len = 21
+    query, _, _, key_cache, value_cache, table = make_grouped_case(
+        num_query_heads=num_query_heads, num_kv_heads=num_kv_heads, seq_len=seq_len
+    )
+
+    actual = paged_attention_triton(
+        query.cuda(), key_cache.cuda(), value_cache.cuda(), table.cuda(), seq_len
+    )
+    expected = paged_attention_torch(query, key_cache, value_cache, table, seq_len)
 
     assert torch.allclose(actual.cpu(), expected, atol=1e-4)

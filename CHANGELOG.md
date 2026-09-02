@@ -20,14 +20,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forward pass that fills the pool one layer at a time rather than all at once.
 - **`PagedEngine.decode_step`** — one decode step, on either the paged or the
   gathered route, so the two cannot drift.
+- **Grouped-query attention on the paged path** — `paged_attention_torch` and
+  the Triton kernel now map each group of query heads onto its shared KV head,
+  so a model with fewer KV heads than attention heads decodes through the block
+  table instead of being deferred. Neither implementation expands the keys.
+  `kv_group_size` rejects head counts that do not divide evenly rather than
+  guessing a mapping.
+- **`worker/tests/test_architectures.py`** — the decode stack run end to end
+  against three non-GPT-2 families on tiny random hub checkpoints: Llama
+  (rotary positions), Mistral (rotary plus grouped-query attention, 4 query
+  heads onto 2 KV heads) and GPT-NeoX (partial rotary, parallel residual).
+  Reference, paged (kernel path and gather fallback), continuous batching
+  (the scheduler directly and `BatchedEngine` under concurrent threads) and
+  speculative decoding are each held to reference-identical token ids. In the
+  default test run, not behind `slow`.
+
+### Fixed
+
+- **Deferred attention shapes ran with no mask at all.** Selecting a custom
+  implementation through `ALL_ATTENTION_FUNCTIONS` makes transformers skip mask
+  construction entirely — it assumes a vLLM-style kernel masks internally — so
+  every shape `attention_hook` defers back to `sdpa_attention_forward` received
+  `attention_mask=None`. Continuous batching therefore attended to its own left
+  padding, and speculative verification aligned its causal mask to the top left
+  of a non-square score matrix. Both silently changed the output. The
+  implementation name is now registered against `sdpa_mask` in
+  `ALL_MASK_ATTENTION_FUNCTIONS`, so the fallback gets exactly the mask plain
+  `sdpa` would have. This was never Llama-specific: it affects GPT-2 too, and
+  went unnoticed only because `sshleifer/tiny-gpt2` has two heads of one
+  dimension each, which leaves its argmax indifferent to what attention returns.
+- **Grouped-query models decoded against a one-token context.** The hook
+  deferred GQA to the model's own attention, but `PagedEngine.decode_step`
+  hands the model no `past_key_values` when the hook is installed, so the
+  deferral attended over the new token alone and wrote nothing into the pool.
+  The output was wrong rather than merely slow. Fixed by covering GQA in the
+  kernel; the `decode_step` fast path now has no reachable deferral.
+- **Sliding-window models are declined rather than answered wrongly.** The
+  block-table walk attends to every cached position, so a model that should
+  forget the start of its context would remember it. `enable_paged_attention`
+  now keeps such a model on the gather path — but only when the window is
+  narrower than the model's own position limit, so a window that can never bind
+  costs nothing.
 
 ### Notes
 
-- Prefill, batched decode, and grouped-query attention deliberately stay on the
-  model's own attention; an uninstallable hook falls back to gathering.
+- Prefill and batched decode still deliberately stay on the model's own
+  attention; an uninstallable hook falls back to gathering.
 - The integration is verified on CPU, where the dispatcher selects the torch
   implementation. It has never been run on CUDA, so the Triton kernel's
-  behaviour *on the decode path* is untested.
+  behaviour *on the decode path* is untested — including its grouped-query
+  head mapping, which is checked against the torch implementation only by
+  GPU-marked tests that skip without a device.
+- The architecture coverage is on randomly-initialised checkpoints of one to
+  two million parameters. It proves head-count resolution, position handling,
+  mask construction and block-table indexing; it says nothing about output
+  quality, and no model of a realistic size has been decoded through these
+  engines.
 
 ## [0.1.0] - 2026-09-01
 

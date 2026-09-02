@@ -261,6 +261,70 @@ def test_engine_falls_back_to_gathering_when_the_hook_cannot_install(
     assert spy.calls == 0
 
 
+def test_installing_the_hook_still_builds_the_mask_the_fallback_needs(paged):
+    """The deferred shapes must get the mask plain sdpa would have got.
+
+    transformers builds no mask at all for an attention implementation it does
+    not recognise, on the assumption that a custom kernel masks internally.
+    That assumption is false for every shape this hook defers, and the failure
+    is silent: batched decode attended to its left padding and a speculative
+    verification pass mis-aligned its causal mask, both of which merely change
+    the answer. Registering the name against `sdpa_mask` is what prevents it.
+    """
+    from transformers.masking_utils import (
+        ALL_MASK_ATTENTION_FUNCTIONS,
+        create_causal_mask,
+        sdpa_mask,
+    )
+
+    assert ALL_MASK_ATTENTION_FUNCTIONS[PAGED_ATTENTION_IMPLEMENTATION] is sdpa_mask
+
+    # One padded row and one full row, the batched-decode shape exactly.
+    padding = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]], dtype=torch.long)
+    mask = create_causal_mask(
+        config=paged.model.config,
+        inputs_embeds=torch.zeros(2, 5, 8),
+        attention_mask=padding,
+        past_key_values=None,
+    )
+
+    assert mask is not None
+    # The padded row must not be allowed to look at its own padding.
+    assert not bool(mask[0, 0, -1, 0])
+    assert bool(mask[1, 0, -1, 0])
+
+
+@pytest.mark.parametrize(
+    ("window", "limit", "expected"),
+    [(4096, 32768, True), (4096, 512, False), (None, 2048, False)],
+    ids=["binds", "never_reached", "no_window"],
+)
+def test_a_sliding_window_the_model_can_outgrow_is_refused(window, limit, expected):
+    """The block-table walk attends to everything it has stored.
+
+    A model asked to forget the start of its context would quietly remember
+    it, so the hook declines rather than answer a different question. A window
+    wider than the model's own position limit can never bind and is fine --
+    which is what keeps the tiny Mistral on the paged path.
+    """
+    from transformers import MistralConfig
+
+    config = MistralConfig(sliding_window=window, max_position_embeddings=limit)
+
+    assert attention_hook.has_binding_sliding_window(config) is expected
+
+
+def test_enable_declines_a_model_with_a_binding_sliding_window():
+    from transformers import MistralConfig
+
+    class Model:
+        config = MistralConfig(sliding_window=4096, max_position_embeddings=32768)
+
+    Model.config._attn_implementation = "sdpa"
+
+    assert attention_hook.enable_paged_attention(Model()) is False
+
+
 def test_enable_reports_false_for_an_unsupported_base_implementation():
     """The hook has exactly one fallback, so it will not displace anything else.
 
@@ -369,12 +433,12 @@ def test_hook_follows_a_block_table_it_did_not_allocate_first():
 
 
 @pytest.mark.parametrize(
-    ("batch", "q_len", "kv_heads"),
-    [(2, 1, 2), (1, 3, 2), (1, 1, 1)],
-    ids=["batched", "prefill", "grouped_query"],
+    ("batch", "q_len", "num_heads", "kv_heads"),
+    [(2, 1, 2, 2), (1, 3, 2, 2), (1, 1, 6, 4)],
+    ids=["batched", "prefill", "ragged_kv_heads"],
 )
 def test_hook_defers_shapes_the_kernel_does_not_cover(
-    monkeypatch, batch, q_len, kv_heads
+    monkeypatch, batch, q_len, num_heads, kv_heads
 ):
     """Unsupported shapes go to the model's own attention, not to an error."""
     deferred = []
@@ -386,15 +450,64 @@ def test_hook_defers_shapes_the_kernel_does_not_cover(
 
     cache = PagedKVCache(num_layers=1, num_blocks=8, block_size=4)
     cache.add_sequence(0)
-    cache.append(0, [kv_sequence(2, 4, 4)])
+    cache.append(0, [kv_sequence(kv_heads, 4, 4)])
     position = cache.reserve(0, 1)
 
-    query = torch.randn(batch, 2, q_len, 4)
+    query = torch.randn(batch, num_heads, q_len, 4)
     key = torch.randn(batch, kv_heads, q_len, 4)
     with paged_decode(cache, 0, position):
         paged_attention_forward(FakeAttention(), query, key, key, None, scaling=0.5)
 
     assert len(deferred) == 1
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "kv_heads"), [(4, 2), (4, 1), (4, 4)], ids=["gqa", "mqa", "mha"]
+)
+def test_hook_walks_the_block_table_for_grouped_query_attention(
+    monkeypatch, num_heads, kv_heads
+):
+    """Fewer KV heads than query heads is handled, not deferred.
+
+    This is the exclusion that used to send Mistral back to the model's own
+    attention -- and, because `decode_step` hands the model no past when the
+    hook is installed, back to attending over a one-token context. The pool
+    already stores whatever KV shape the model produces, so the only thing
+    missing was the head mapping.
+    """
+    deferred = []
+    monkeypatch.setattr(
+        attention_hook,
+        "sdpa_attention_forward",
+        lambda *args, **kwargs: (deferred.append(args) or (None, None)),
+    )
+
+    cache = PagedKVCache(num_layers=1, num_blocks=8, block_size=4)
+    cache.add_sequence(0)
+    keys, values = kv_sequence(kv_heads, 4, 4)
+    cache.append(0, [(keys, values)])
+    position = cache.reserve(0, 1)
+
+    new_key = torch.randn(1, kv_heads, 1, 4)
+    new_value = torch.randn(1, kv_heads, 1, 4)
+    query = torch.randn(1, num_heads, 1, 4)
+    scale = 1.0 / math.sqrt(4)
+    with paged_decode(cache, 0, position):
+        output, _ = paged_attention_forward(
+            FakeAttention(), query, new_key, new_value, None, scaling=scale
+        )
+
+    group = num_heads // kv_heads
+    full_keys = torch.cat([keys, new_key], dim=2)[0].repeat_interleave(group, dim=0)
+    full_values = torch.cat([values, new_value], dim=2)[0].repeat_interleave(
+        group, dim=0
+    )
+    scores = torch.einsum("hd,htd->ht", query[0, :, 0, :], full_keys) * scale
+    expected = torch.einsum("ht,htd->hd", torch.softmax(scores, dim=-1), full_values)
+
+    assert deferred == []
+    assert output.shape == (1, 1, num_heads, 4)
+    assert torch.allclose(output[0, 0], expected, atol=1e-6)
 
 
 def test_hook_defers_when_no_sequence_is_being_decoded(monkeypatch):

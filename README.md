@@ -107,12 +107,29 @@ and `PagedKVCache.gather` is never called during decode. The dispatcher is what
 is wired in, so CUDA gets the Triton kernel and everything else gets the torch
 implementation.
 
-Three cases deliberately stay on the model's own attention: **prefill** (many
+**Grouped-query attention is covered.** The pool stores whatever KV head count
+the model produces, and the kernel folds each group of query heads onto its
+shared KV head — in the torch implementation by reshaping the query, in the
+Triton kernel by dividing the program's head id down. Neither expands the keys,
+which would be the copy paging exists to avoid.
+
+Two cases deliberately stay on the model's own attention: **prefill** (many
 query positions, one dense pass either way, not the per-token cost the kernel
-removes), **batched decode** under `ContinuousBatcher` (one padded cache for the
-whole batch), and **grouped-query attention**. If the hook cannot be installed —
-a transformers without the attention interface, or a model not on `sdpa` — the
+removes) and **batched decode** under `ContinuousBatcher` (one padded cache for
+the whole batch). The hook also declines to install on a model whose declared
+**sliding window** is narrower than its own position limit, because the
+block-table walk attends to every cached position and would remember a context
+the model is supposed to have forgotten. If the hook cannot be installed — a
+transformers without the attention interface, or a model not on `sdpa` — the
 engine falls back to gathering, which is slower and identical.
+
+Selecting a custom attention implementation has one consequence worth naming:
+transformers builds **no attention mask at all** for an implementation it does
+not recognise, on the assumption that a vLLM-style kernel masks internally. The
+single-token walk needs no mask, but every deferred shape does, so the hook
+registers its name against `sdpa_mask` in `ALL_MASK_ATTENTION_FUNCTIONS` as
+well. Without that, batched decode attends to its left padding and speculative
+verification mis-aligns its causal mask.
 
 **What is verified, and where.** The integration is tested on CPU against the
 reference engine, and the tests fail if the engine silently reverts to
@@ -274,16 +291,39 @@ argument wins over the configured value.
 
 ## Supported models
 
-Tested end to end against `sshleifer/tiny-gpt2` (the test suite) and `gpt2`
-(the default).
+Four architecture families are decoded end to end by the default test run, on
+CPU, through every engine — reference, paged (kernel path *and* gather
+fallback), continuous batching (both the scheduler directly and `BatchedEngine`
+under concurrent threads), and speculative — with every engine asserted to emit
+the reference engine's token ids:
+
+| Family | Checkpoint | What it adds |
+| --- | --- | --- |
+| GPT-2 | `sshleifer/tiny-gpt2` | learned position embeddings |
+| Llama | `hf-internal-testing/tiny-random-LlamaForCausalLM` | rotary positions |
+| Mistral | `hf-internal-testing/tiny-random-MistralForCausalLM` | rotary positions, grouped-query attention (4 query heads → 2 KV heads) |
+| GPT-NeoX | `hf-internal-testing/tiny-random-GPTNeoXForCausalLM` | partial rotary, parallel attention/MLP residual |
+
+`gpt2` (the serving default) is exercised by hand rather than by the suite.
+
+These are the hub's own randomly-initialised test checkpoints, one to two
+million parameters each. They prove the *plumbing* — head-count resolution,
+position handling, mask construction, block-table indexing — on architectures
+that differ where it matters. They say nothing about output quality, and
+nothing about scale: no model above a few million parameters has been run
+here, and none on a GPU.
 
 Layer count and position limits are resolved through whichever attribute names
-an architecture uses, so GPT-2, Llama, Mistral and OPT-style configs all load.
-That resolution is unit-tested across those config classes; what is *not*
-claimed is that any given large model has been run end to end here, because it
-has not. Decoding is architecture-agnostic beyond this point -- the cache stores
-whatever key/value shapes the model produces -- but treat a new family as
-unverified until you have run it.
+an architecture uses, so OPT-style configs load too; that resolution is
+unit-tested in `test_config.py` across `GPT2Config`, `LlamaConfig` and
+`MistralConfig`. Decoding is architecture-agnostic beyond this point — the
+cache stores whatever key/value shapes the model produces — but treat a family
+outside the table above as unverified until you have run it.
+
+A model that declares a sliding window narrower than its own position limit
+(Mistral-7B, for instance) loads and decodes correctly, but keeps the gather
+path: the paged kernel attends to the whole block table and has no way to
+express the window. See [Limitations](#limitations).
 
 ## Development
 
@@ -350,8 +390,13 @@ small for the results to say anything about real serving.
 
 ## Limitations
 
-- Paged attention is wired into single-sequence decode only. Prefill, batched
-  decode, and grouped-query attention stay on the model's own attention.
+- Paged attention is wired into single-sequence decode only. Prefill and
+  batched decode stay on the model's own attention. Grouped-query attention is
+  covered as of the current `Unreleased` changes; sliding-window models are
+  not, and the hook declines to install on one it could outgrow.
+- The architecture coverage is on tiny random checkpoints, on CPU. Nothing
+  larger than a few million parameters has been decoded through these engines,
+  so per-architecture *performance* is entirely unmeasured.
 - The Triton kernel has never been run as part of that integration: this repo's
   tests run on CPU, where the dispatcher selects the torch implementation. On a
   CUDA machine the hook dispatches to `paged_attention_triton`, which is tested

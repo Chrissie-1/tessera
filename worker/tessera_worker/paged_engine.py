@@ -119,9 +119,11 @@ class PagedEngine(ReferenceEngine):
                 # model would otherwise concatenate a second copy of it. That
                 # also means the position has to be stated, since there is no
                 # cache length for the model to infer it from. `position_ids`
-                # is the signal GPT-2 reads, and is what this is tested on; an
-                # architecture that positions itself from `cache_position`
-                # instead would need that passed too.
+                # is enough for the learned embeddings GPT-2 looks them up in
+                # and for the rotary embeddings Llama, Mistral and GPT-NeoX
+                # compute from them, which `test_architectures.py` covers.
+                # An architecture that positioned itself from `cache_position`
+                # alone would need that passed too.
                 outputs = self.model(
                     input_ids=input_ids,
                     use_cache=False,

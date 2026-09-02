@@ -21,14 +21,28 @@ What it deliberately does not do:
   not the per-token cost the kernel was written to remove.
 * Batched decode. `ContinuousBatcher` attends to a whole batch through one
   padded cache; walking a separate block table per row is a different kernel.
-* Grouped-query attention. The pool stores KV heads, and folding several query
-  heads onto one of them is not something `paged_attention` expresses.
+* Sliding-window attention. The block-table walk attends to every cached
+  position, so a model that is supposed to forget the start of its context
+  would quietly remember it. The hook declines to install on such a model
+  rather than answer a different question than the one asked.
 
-Every one of those falls through to `sdpa_attention_forward`, the exact
-function the model was already dispatching to, so an unsupported case is
-identical to what it was before the hook existed. For the same reason the hook
-declines to install itself unless the model is on `sdpa`: it has one fallback,
-and it will not silently substitute it for a different implementation.
+Grouped-query attention *is* covered: the pool already stores whatever KV
+head count the model produces, and `paged_attention` folds each group of query
+heads onto its shared KV head.
+
+The uncovered cases fall through to `sdpa_attention_forward`, the exact
+function the model was already dispatching to. For that fallback to be
+faithful the hook has to do one thing beyond registering itself: transformers
+builds no attention mask at all for an implementation it does not recognise,
+on the assumption that a custom kernel masks internally. That assumption holds
+for the single-token walk and fails for everything else -- padded batched
+decode would attend to the padding, and a speculative verification pass would
+mis-align its causal mask. So the implementation name is registered against
+`sdpa_mask` too, and the fallback receives the mask it always did.
+
+For the same reason the hook declines to install itself unless the model is on
+`sdpa`: it has one fallback, and it will not silently substitute it for a
+different implementation.
 
 Integrating through the dispatcher rather than through
 `paged_attention_triton` is what makes this testable: the same wiring runs the
@@ -49,16 +63,20 @@ from dataclasses import dataclass
 import torch
 
 from .attention import paged_attention
+from .config import max_positions
 from .paged import PagedKVCache
 
 try:  # pragma: no cover - import guard, exercised by absence not by tests
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, sdpa_mask
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
     HAS_ATTENTION_INTERFACE = True
 except ImportError:  # pragma: no cover
     sdpa_attention_forward = None
     ALL_ATTENTION_FUNCTIONS = None
+    ALL_MASK_ATTENTION_FUNCTIONS = None
+    sdpa_mask = None
     HAS_ATTENTION_INTERFACE = False
 
 logger = logging.getLogger(__name__)
@@ -139,7 +157,9 @@ def paged_attention_forward(
     Args:
         module: the attention layer; only `layer_idx` is read from it.
         query: (batch, num_heads, q_len, head_dim).
-        key: this step's keys, same layout, not yet in the pool.
+        key: this step's keys, same layout but with the model's KV head count,
+            which is smaller than `num_heads` under grouped-query attention.
+            Not yet in the pool.
         value: this step's values.
         attention_mask: ignored on the paged path -- a single query position
             sits after every cached position, so the causal mask admits all of
@@ -187,12 +207,38 @@ def paged_attention_forward(
 def _is_paged_decode(query: torch.Tensor, key: torch.Tensor) -> bool:
     """Whether this call is the one shape the block-table walk handles.
 
-    One sequence, one new position, and one key head per query head. Anything
-    else -- prefill, a batched step, grouped-query attention -- is a different
-    kernel, so it goes back to the model's own attention.
+    One sequence and one new position. The KV head count is free to be smaller
+    than the query head count, as long as the groups divide evenly -- that is
+    grouped-query attention, and `paged_attention` folds it. Anything else --
+    prefill, a batched step -- is a different kernel, so it goes back to the
+    model's own attention.
     """
     batch, num_heads, q_len, _ = query.shape
-    return batch == 1 and q_len == 1 and key.shape[1] == num_heads
+    kv_heads = key.shape[1]
+    return (
+        batch == 1
+        and q_len == 1
+        and 0 < kv_heads <= num_heads
+        and num_heads % kv_heads == 0
+    )
+
+
+def has_binding_sliding_window(model_config) -> bool:
+    """Whether the model can decode past a sliding window it declares.
+
+    The block-table walk attends over every cached position, so a window the
+    sequence never reaches costs nothing and one it does reach silently
+    changes the answer. A window at least as wide as the model's own position
+    limit can never bind, which is the case for the tiny Mistral the tests
+    use; a 4k window on a 32k model is exactly the case to refuse.
+    """
+    window = getattr(model_config, "sliding_window", None)
+    if not window:
+        return False
+    # Qwen-style configs carry a window they may have switched off.
+    if getattr(model_config, "use_sliding_window", True) is False:
+        return False
+    return int(window) < max_positions(model_config)
 
 
 def enable_paged_attention(model) -> bool:
@@ -221,9 +267,24 @@ def enable_paged_attention(model) -> bool:
         )
         return False
 
+    if has_binding_sliding_window(model.config):
+        logger.info(
+            "model attends over a %d-token sliding window it can outgrow; "
+            "paged attention stays on the gather path",
+            model.config.sliding_window,
+        )
+        return False
+
     ALL_ATTENTION_FUNCTIONS.register(
         PAGED_ATTENTION_IMPLEMENTATION, paged_attention_forward
     )
+    # Registering the *mask* under the same name is not optional. transformers
+    # skips mask construction entirely for an implementation it does not know,
+    # assuming a vLLM-style kernel that masks internally; the fallback to
+    # `sdpa_attention_forward` would then run maskless, which is wrong for
+    # every shape this hook defers. Pointing the name at `sdpa_mask` gives the
+    # fallback exactly the mask plain sdpa would have received.
+    ALL_MASK_ATTENTION_FUNCTIONS.register(PAGED_ATTENTION_IMPLEMENTATION, sdpa_mask)
     model.set_attn_implementation(PAGED_ATTENTION_IMPLEMENTATION)
     # `set_attn_implementation` warns and leaves the config alone for models
     # that do not route through the interface, so confirm rather than assume.
