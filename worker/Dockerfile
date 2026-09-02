@@ -25,9 +25,16 @@ RUN pip install --no-cache-dir \
     torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
 
 COPY worker/pyproject.toml /app/pyproject.toml
-RUN pip install --no-cache-dir \
-    "transformers>=5.0" "grpcio>=1.60" "grpcio-tools>=1.60" "protobuf>=4.25" \
-    "fastapi>=0.110" "uvicorn>=0.29" "pydantic>=2.6"
+# Read the dependencies out of pyproject rather than repeating them here. A
+# second copy of the list drifts silently -- adding prometheus-client to
+# pyproject once left this image without it, and a missing runtime dependency
+# does not surface until the container starts.
+#
+# torch is filtered out because it is already installed above from the CPU
+# index; letting pip resolve it here would pull the multi-gigabyte CUDA wheel.
+RUN python -c "import tomllib; d = tomllib.load(open('/app/pyproject.toml','rb')); print('\n'.join(r for r in d['project']['dependencies'] if not r.startswith('torch')))" > /tmp/requirements.txt \
+    && cat /tmp/requirements.txt \
+    && pip install --no-cache-dir -r /tmp/requirements.txt "grpcio-tools>=1.60"
 
 COPY proto /app/proto
 COPY scripts /app/scripts
