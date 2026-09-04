@@ -1,4 +1,4 @@
-# Tessera
+# Tessera — GPU serving: paged KV, speculative decoding
 
 An LLM inference stack built to make each optimisation prove itself: a Rust HTTP
 gateway in front of a Python worker that decodes with a paged KV cache,
